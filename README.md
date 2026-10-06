@@ -1,7 +1,12 @@
-# Ouch Decompress GUI
+<table>
+  <tr>
+    <td width="120"><img src="assets/ouch-decompress-gui-256.png" alt="Ouch Decompress GUI" width="110"></td>
+    <td><h1>Ouch Decompress GUI</h1></td>
+  </tr>
+</table>
 
-A simple, Keka-like **archive extractor** for Linux, powered by
-[ouch](https://github.com/ouch-org/ouch).
+A lightweight, Keka-like **archive extractor** for Linux, written in **Rust**
+and powered by [ouch](https://github.com/ouch-org/ouch).
 
 **This app only decompresses.** It is deliberately focused on extraction;
 creating or editing archives is out of scope.
@@ -20,6 +25,8 @@ AppImage.
 
 ## Features
 
+- **Lightweight and native, written in Rust**: a single small binary plus the
+  bundled `ouch` tool — no runtime and no Electron.
 - Extract archives by double-clicking them, or by opening several at once
   (native file-manager integration).
 - Multiple extraction strategies:
@@ -49,7 +56,7 @@ AppImage.
   and theme (System, Light, Dark) with desktop detection.
 - About window with the app and `ouch` versions, a link to the GitHub project,
   and a background check for new releases.
-- Lightweight and fast: a single Rust binary plus the bundled `ouch` tool.
+- Small self-contained AppImage (about 7 MB) with instant startup.
 
 ## Supported formats
 
