@@ -1,0 +1,42 @@
+[package]
+name = "ouch-decompress-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A simple Keka-like archive extractor for Linux, powered by ouch."
+authors = ["Alarez777"]
+license = "MIT"
+repository = "https://github.com/Alarez777/Ouch-Decompress-Gui"
+keywords = ["archive", "decompress", "extract", "ouch", "gui"]
+categories = ["gui", "compression"]
+
+[[bin]]
+name = "ouch-decompress-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = [
+    "glow",
+    "x11",
+    "wayland",
+    "default_fonts",
+] }
+egui = "0.36"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dirs = "6"
+
+# GNOME/Adwaita-style client-side decorations on Wayland, so the window
+# titlebar matches native GNOME apps.
+winit = { version = "0.30.13", default-features = false, features = [
+    "wayland-csd-adwaita",
+    "wayland-dlopen",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+panic = "abort"

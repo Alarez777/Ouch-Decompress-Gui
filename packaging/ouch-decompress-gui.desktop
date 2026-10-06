@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Ouch Decompress
+Comment=Extract archives with ouch
+Exec=ouch-decompress-gui %F
+TryExec=ouch-decompress-gui
+Icon=ouch-decompress-gui
+Terminal=false
+Categories=Utility;Archiving;
+StartupNotify=false
+StartupWMClass=ouch-decompress-gui
+MimeType=application/zip;application/x-tar;application/x-compressed-tar;application/gzip;application/x-gzip;application/x-bzip2;application/x-bzip3;application/x-xz;application/x-lzma;application/x-lzip;application/x-lz4;application/zstd;application/x-snappy-framed;application/x-brotli;application/x-7z-compressed;application/vnd.rar;application/x-rar;application/vnd.comicbook+zip;application/vnd.comicbook-rar;application/epub+zip;
