@@ -1,9 +1,7 @@
-<table>
-  <tr>
-    <td width="120"><img src="assets/ouch-decompress-gui-256.png" alt="Ouch Decompress GUI" width="110"></td>
-    <td><h1>Ouch Decompress GUI</h1></td>
-  </tr>
-</table>
+<h1 align="center">
+  <img src="assets/ouch-decompress-gui-256.png" alt="Ouch Decompress GUI" width="72" align="middle">
+  Ouch Decompress GUI
+</h1>
 
 A lightweight, Keka-like **archive extractor** for Linux, written in **Rust**
 and powered by [ouch](https://github.com/ouch-org/ouch).
