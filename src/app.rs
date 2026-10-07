@@ -121,6 +121,8 @@ pub struct App {
     overwrite_prompt: Option<OverwritePrompt>,
     password_input: String,
     new_password_input: String,
+    /// Set when a new password prompt appears, so its field gets focus once.
+    password_focus: bool,
     applied_theme: Option<ThemeChoice>,
     /// Indices of queued files whose format is disabled; the user must confirm
     /// before the batch starts.
@@ -208,6 +210,7 @@ impl App {
             overwrite_prompt: None,
             password_input: String::new(),
             new_password_input: String::new(),
+            password_focus: false,
             applied_theme: None,
             confirm_disabled: None,
             association_status: String::new(),
@@ -411,6 +414,7 @@ impl App {
                 error,
             } => {
                 self.password_input.clear();
+                self.password_focus = true;
                 if let Some(file_index) = self.file_index(index) {
                     self.password_prompt = Some(PasswordPrompt {
                         index: file_index,
@@ -1513,6 +1517,12 @@ impl App {
                     .password(true)
                     .desired_width(300.0),
             );
+            // Focus the field as soon as the prompt appears, so the user can
+            // type the password without clicking it first.
+            if self.password_focus {
+                response.request_focus();
+                self.password_focus = false;
+            }
             let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
             ui.add_space(6.0);
