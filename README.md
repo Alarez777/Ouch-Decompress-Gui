@@ -3,8 +3,8 @@
   Ouch Decompress GUI
 </h1>
 
-A lightweight, Keka-like **archive extractor** for Linux, written in **Rust**
-and powered by [ouch](https://github.com/ouch-org/ouch).
+A lightweight GUI to **extract archives** on Linux, written in **Rust** and
+powered by [ouch](https://github.com/ouch-org/ouch).
 
 > **Independent, unofficial project.** This app is **not** developed, endorsed or
 > maintained by the `ouch` authors. It is an independent GUI that simply runs

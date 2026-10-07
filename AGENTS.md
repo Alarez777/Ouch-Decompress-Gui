@@ -4,7 +4,7 @@ Guidance for AI coding agents working on this repository.
 
 ## Project
 
-`ouch-decompress-gui` is an extract-only, Keka-like archive GUI for Linux,
+`ouch-decompress-gui` is an extract-only archive GUI for Linux,
 written in Rust with `egui`/`eframe`. `ouch` is a binary-only crate, so the app
 runs the bundled `ouch` executable as a subprocess; every interaction with it
 (and all parsing of its output) lives in `src/ouch.rs`.
