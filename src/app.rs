@@ -171,6 +171,10 @@ impl App {
 
         let logo = load_logo(&cc.egui_ctx);
 
+        // Drop the duplicate desktop entry older versions installed, when the
+        // AppImage manager already provides one.
+        crate::association::remove_legacy_if_redundant();
+
         let auto_close_on_success = !initial_files.is_empty() && !open_settings;
         let initial_scale = config.ui_scale;
 
@@ -1358,51 +1362,16 @@ impl App {
                 .small()
                 .color(egui::Color32::GRAY),
         );
-        if crate::association::is_installed() {
-            ui.label(
-                egui::RichText::new(self.i18n.t("settings.associations_installed"))
-                    .small()
-                    .color(egui::Color32::from_rgb(0x2e, 0xa0, 0x43)),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new(self.i18n.t("settings.associations_not_installed"))
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
+        if ui.button(self.i18n.t("settings.set_default")).clicked() {
+            match crate::association::set_default(&self.config) {
+                Ok(()) => {
+                    self.association_status = self.i18n.t("settings.set_default.done");
+                }
+                Err(err) => {
+                    self.association_status = format!("{}: {err}", self.i18n.t("common.error"));
+                }
+            }
         }
-        ui.horizontal_wrapped(|ui| {
-            if ui.button(self.i18n.t("settings.associate")).clicked() {
-                match crate::association::apply(&self.config) {
-                    Ok(()) => {
-                        self.association_status = self.i18n.t("settings.associate.done");
-                    }
-                    Err(err) => {
-                        self.association_status = format!("{}: {err}", self.i18n.t("common.error"));
-                    }
-                }
-            }
-            if ui.button(self.i18n.t("settings.set_default")).clicked() {
-                match crate::association::set_default(&self.config) {
-                    Ok(()) => {
-                        self.association_status = self.i18n.t("settings.set_default.done");
-                    }
-                    Err(err) => {
-                        self.association_status = format!("{}: {err}", self.i18n.t("common.error"));
-                    }
-                }
-            }
-            if ui.button(self.i18n.t("settings.disassociate")).clicked() {
-                match crate::association::remove() {
-                    Ok(()) => {
-                        self.association_status = self.i18n.t("settings.disassociate.done");
-                    }
-                    Err(err) => {
-                        self.association_status = format!("{}: {err}", self.i18n.t("common.error"));
-                    }
-                }
-            }
-        });
         if !self.association_status.is_empty() {
             ui.label(
                 egui::RichText::new(&self.association_status)
