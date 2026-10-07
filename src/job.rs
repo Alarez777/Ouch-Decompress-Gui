@@ -80,6 +80,9 @@ pub enum JobAnswer {
 pub struct JobController {
     pub answer_tx: Sender<JobAnswer>,
     pub cancel_all: Arc<AtomicBool>,
+    /// PID of the `ouch` process currently running, or 0 when none is. The UI
+    /// uses it to terminate the child if the user closes mid-extraction.
+    pub current_pid: Arc<AtomicU32>,
 }
 
 /// Spawns the extraction worker.
@@ -95,19 +98,31 @@ pub fn spawn(
     let (event_tx, event_rx) = mpsc::channel::<JobEvent>();
     let (answer_tx, answer_rx) = mpsc::channel::<JobAnswer>();
     let cancel_all = Arc::new(AtomicBool::new(false));
+    let current_pid = Arc::new(AtomicU32::new(0));
 
     let controller = JobController {
         answer_tx,
         cancel_all: cancel_all.clone(),
+        current_pid: current_pid.clone(),
     };
 
     thread::spawn(move || {
-        run(ouch, archives, config, event_tx, answer_rx, cancel_all, ctx);
+        run(
+            ouch,
+            archives,
+            config,
+            event_tx,
+            answer_rx,
+            cancel_all,
+            current_pid,
+            ctx,
+        );
     });
 
     (controller, event_rx)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     ouch: OuchClient,
     archives: Vec<PathBuf>,
@@ -115,6 +130,7 @@ fn run(
     event_tx: Sender<JobEvent>,
     answer_rx: Receiver<JobAnswer>,
     cancel_all: Arc<AtomicBool>,
+    current_pid: Arc<AtomicU32>,
     ctx: egui::Context,
 ) {
     // Password remembered from the first successful prompt, reused afterwards.
@@ -134,6 +150,7 @@ fn run(
             &answer_rx,
             &event_tx,
             index,
+            &current_pid,
             &ctx,
         );
         send(&event_tx, &ctx, event);
@@ -151,6 +168,7 @@ fn process_one(
     answer_rx: &Receiver<JobAnswer>,
     event_tx: &Sender<JobEvent>,
     index: usize,
+    current_pid: &Arc<AtomicU32>,
     ctx: &egui::Context,
 ) -> JobEvent {
     if !archive.exists() {
@@ -165,9 +183,9 @@ fn process_one(
 
     // Progress reporting is based on the bytes `ouch` reads from the archive,
     // so it works even for a single huge file (where counting entries does
-    // not). The guard stops the poller when this function returns.
-    let pid_slot = Arc::new(AtomicU32::new(0));
-    let _progress = ProgressPoller::spawn(index, archive, pid_slot.clone(), event_tx, ctx);
+    // not). The guard stops the poller when this function returns. `current_pid`
+    // is shared with the UI so it can kill the child if the user closes.
+    let _progress = ProgressPoller::spawn(index, archive, current_pid.clone(), event_tx, ctx);
 
     let is_archive = formats::is_archive_path(archive);
 
@@ -195,7 +213,7 @@ fn process_one(
             return fail(index, message);
         }
         let result = result_name(archive, false, None);
-        return match ouch.decompress(archive, Target::Here, None, &pid_slot) {
+        return match ouch.decompress(archive, Target::Here, None, current_pid) {
             Ok(outcome) if outcome.success => {
                 finish_success(index, archive, "here", result, config, event_tx, ctx)
             }
@@ -291,7 +309,7 @@ fn process_one(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
-        match ouch.decompress(archive, target, candidate.as_deref(), &pid_slot) {
+        match ouch.decompress(archive, target, candidate.as_deref(), current_pid) {
             Ok(outcome) if outcome.success => {
                 if candidate.is_some() {
                     *batch_password = candidate;
@@ -336,7 +354,7 @@ fn process_one(
         first_prompt = false;
         match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
             JobAnswer::Password(password) => {
-                match ouch.decompress(archive, target, Some(&password), &pid_slot) {
+                match ouch.decompress(archive, target, Some(&password), current_pid) {
                     Ok(outcome) if outcome.success => {
                         *batch_password = Some(password);
                         return finish_success(
@@ -1027,6 +1045,7 @@ mod tests {
             let _ = answer_tx.send(answer.clone());
         }
 
+        let current_pid = Arc::new(AtomicU32::new(0));
         let event = process_one(
             ouch,
             archive,
@@ -1035,6 +1054,7 @@ mod tests {
             &answer_rx,
             &event_tx,
             0,
+            &current_pid,
             &ctx,
         );
         let events: Vec<JobEvent> = event_rx.try_iter().collect();
