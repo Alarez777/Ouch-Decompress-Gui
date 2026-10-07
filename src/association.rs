@@ -1,13 +1,13 @@
 //! User-level file associations.
 //!
-//! Installing an association writes two files and refreshes the XDG databases:
+//! Setting the app as the default handler only runs `xdg-mime default` for the
+//! enabled MIME types. The desktop entry itself is normally provided by the
+//! AppImage manager (e.g. Gear Lever); this module detects it and uses it, so
+//! it does not create a second, duplicate entry.
 //!
-//! * `~/.local/share/applications/ouch-decompress-gui.desktop`
-//! * `~/.local/share/mime/packages/ouch-decompress-gui.xml`
-//!
-//! Then `update-mime-database` and `update-desktop-database` are invoked.
-//! `set_default` additionally calls `xdg-mime default` to claim the enabled
-//! MIME types. Everything lives in the user's home, so no root is required.
+//! The legacy entry/mime/icons that older versions installed are only written
+//! as a fallback when no other launcher exists, and are removed when a real one
+//! is found. Everything lives in the user's home, so no root is required.
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -68,11 +68,6 @@ pub fn mime_package_path() -> PathBuf {
 /// `~/.local/share/icons/hicolor`
 pub fn icons_dir() -> PathBuf {
     data_dir().join("icons").join("hicolor")
-}
-
-/// True when an association is currently installed.
-pub fn is_installed() -> bool {
-    desktop_path().exists()
 }
 
 /// Returns the MIME types that should be associated for the enabled formats.
@@ -172,6 +167,7 @@ pub fn build_desktop(config: &Config) -> String {
          Version=1.0\n\
          Name=Ouch Decompress\n\
          Comment=Extract archives with ouch\n\
+         Icon=ouch-decompress-gui\n\
          Exec={exec} %F\n\
          TryExec={try_exec}\n\
          Terminal=false\n\
@@ -193,10 +189,9 @@ fn quote_exec(path: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Installs or refreshes the association (desktop entry, MIME package and
-/// icons) for the currently enabled formats, without changing which app is the
-/// default handler.
-pub fn apply(config: &Config) -> Result<()> {
+/// Installs a fallback desktop entry, MIME package and icons for the enabled
+/// formats. Only used when no AppImage manager provides a launcher.
+fn apply(config: &Config) -> Result<()> {
     let desktop = desktop_path();
     let mime = mime_package_path();
 
@@ -219,20 +214,74 @@ pub fn apply(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Makes this app the default handler for every enabled MIME type, in one
-/// step, installing the association first if needed.
+/// Basename of a desktop entry (other than ours) that launches this app, such
+/// as the one an AppImage manager creates for the file.
+fn find_external_launcher() -> Option<String> {
+    let target = app_exec_path();
+    let target = target.to_string_lossy();
+    for entry in std::fs::read_dir(applications_dir()).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name == DESKTOP_FILE {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Either the entry runs this file, or it is this app's window class
+        // (the AppImage manager may point at a copy in another location).
+        let runs_this_file = text.lines().any(|line| {
+            line.strip_prefix("Exec=")
+                .is_some_and(|exec| exec.contains(target.as_ref()))
+        });
+        let same_window_class = text
+            .lines()
+            .any(|line| line.trim() == "StartupWMClass=ouch-decompress-gui");
+        if runs_this_file || same_window_class {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Removes the legacy entry/mime/icons this app used to install, when another
+/// manager already provides a launcher for this AppImage.
+pub fn remove_legacy_if_redundant() {
+    if desktop_path().exists() && find_external_launcher().is_some() {
+        let _ = remove();
+    }
+}
+
+/// Makes this app the default handler for every enabled MIME type, using the
+/// desktop entry provided by the AppImage manager when there is one.
 pub fn set_default(config: &Config) -> Result<()> {
-    apply(config)?;
+    let handler = match find_external_launcher() {
+        Some(name) => {
+            // Another manager owns the entry; drop our duplicate if present.
+            let _ = remove();
+            name
+        }
+        None => {
+            apply(config)?;
+            DESKTOP_FILE.to_string()
+        }
+    };
     for mime_type in enabled_mime_types(config) {
         let _ = Command::new("xdg-mime")
-            .args(["default", DESKTOP_FILE, &mime_type])
+            .args(["default", &handler, &mime_type])
             .status();
     }
     Ok(())
 }
 
-/// Removes the association and refreshes the XDG databases.
-pub fn remove() -> Result<()> {
+/// Removes the legacy desktop entry, MIME package and icons, then refreshes the
+/// XDG databases.
+fn remove() -> Result<()> {
     let _ = std::fs::remove_file(desktop_path());
     let _ = std::fs::remove_file(mime_package_path());
     remove_icons();
@@ -312,6 +361,7 @@ mod tests {
         assert!(!desktop.contains("application/vnd.rar"));
         assert!(desktop.contains("Exec=\""));
         assert!(desktop.contains("%F"));
+        assert!(desktop.contains("Icon=ouch-decompress-gui"));
         assert!(desktop.contains("StartupWMClass=ouch-decompress-gui"));
         // TryExec must be a bare path, or GIO refuses to load the entry.
         assert!(!desktop.contains("TryExec=\""));
