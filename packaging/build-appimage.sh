@@ -126,8 +126,23 @@ download \
     "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$APPIMAGE_ARCH.AppImage" \
     "$APPIMAGETOOL"
 
+# Embed update information so AppImage managers (e.g. Gear Lever, which reads
+# the ELF `.upd_info` section) can update the installed file from GitHub
+# Releases. appimagetool bundles its own zsyncmake and also generates the
+# matching `Ouch-Decompress-Gui-<arch>.AppImage.zsync`.
+GH_REPO="${GITHUB_REPOSITORY:-Alarez777/Ouch-Decompress-Gui}"
+GH_OWNER="${GH_REPO%%/*}"
+GH_NAME="${GH_REPO##*/}"
+UPDATE_INFO="gh-releases-zsync|${GH_OWNER}|${GH_NAME}|latest|Ouch-Decompress-Gui-*${APPIMAGE_ARCH}.AppImage.zsync"
+
 OUTPUT="$DIST_DIR/Ouch-Decompress-Gui-$APPIMAGE_ARCH.AppImage"
 ARCH="$APPIMAGE_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 \
-    "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+    "$APPIMAGETOOL" --updateinformation "$UPDATE_INFO" "$APPDIR" "$OUTPUT"
+
+# zsyncmake may drop the `.zsync` in the current directory instead of next to
+# the AppImage; move it so the release upload picks it up.
+if [ ! -f "$OUTPUT.zsync" ] && [ -f "$(basename "$OUTPUT").zsync" ]; then
+    mv "$(basename "$OUTPUT").zsync" "$OUTPUT.zsync"
+fi
 
 echo "==> Done: $OUTPUT"

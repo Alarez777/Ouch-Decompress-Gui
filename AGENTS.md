@@ -66,3 +66,6 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
   GitHub release.
 - Before tagging, bump `Cargo.toml` to the release version and add a matching
   section to `CHANGELOG.md`; the release body is taken from that section.
+- The AppImages embed `gh-releases-zsync` update information and the release
+  ships the matching `.zsync` files, so AppImage managers (Gear Lever,
+  AppImageUpdate) can update an installed AppImage from GitHub Releases.
