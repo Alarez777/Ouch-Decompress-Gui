@@ -105,9 +105,9 @@ impl TrashFallback {
 #[serde(rename_all = "snake_case")]
 pub enum Notifications {
     /// Notify after every batch.
-    #[default]
     Always,
     /// Only notify when a batch had failures or was interrupted.
+    #[default]
     OnFailure,
     /// Never notify.
     Never,
@@ -206,7 +206,7 @@ impl Default for Config {
             conflict_policy: ConflictPolicy::Ask,
             after_extract: AfterExtract::Trash,
             trash_fallback: TrashFallback::Delete,
-            notifications: Notifications::Always,
+            notifications: Notifications::OnFailure,
         }
     }
 }
@@ -306,5 +306,11 @@ mod tests {
 
         let config: Config = serde_json::from_str(r#"{"notifications": "never"}"#).unwrap();
         assert_eq!(config.notifications, Notifications::Never);
+    }
+
+    #[test]
+    fn notifications_default_to_on_failure() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.notifications, Notifications::OnFailure);
     }
 }
