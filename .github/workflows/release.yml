@@ -59,7 +59,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Ouch-Decompress-Gui-${{ matrix.arch }}
-          path: dist/*.AppImage
+          path: |
+            dist/*.AppImage
+            dist/*.zsync
           if-no-files-found: error
 
   release:
@@ -98,7 +100,9 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.AppImage
+          files: |
+            artifacts/*.AppImage
+            artifacts/*.zsync
           body_path: release_notes.md
           generate_release_notes: false
           fail_on_unmatched_files: true

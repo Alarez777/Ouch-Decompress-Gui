@@ -2,6 +2,7 @@
 /dist
 /.cache
 *.AppImage
+*.zsync
 *.o
 *.so
 squashfs-root/
