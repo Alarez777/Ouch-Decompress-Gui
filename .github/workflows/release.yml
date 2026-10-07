@@ -1,6 +1,6 @@
 name: Release
 
-# Builds the AppImage only when a tag like `v0.1.0` is pushed to main.
+# Builds the AppImages only when a tag like `v0.2.0` is pushed.
 on:
   push:
     tags:
@@ -10,8 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  appimage:
-    name: AppImage (${{ matrix.arch }})
+  build:
+    name: Build AppImage (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -62,8 +62,43 @@ jobs:
           path: dist/*.AppImage
           if-no-files-found: error
 
-      - name: Attach to GitHub release
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download AppImages
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Uses the section of CHANGELOG.md that matches the pushed tag.
+      - name: Build release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > release_notes.md
+
+          previous="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "$previous" ]; then
+            printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$previous" "$GITHUB_REF_NAME" >> release_notes.md
+          fi
+
+          cat release_notes.md
+
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.AppImage
-          generate_release_notes: true
+          files: artifacts/*.AppImage
+          body_path: release_notes.md
+          generate_release_notes: false
+          fail_on_unmatched_files: true

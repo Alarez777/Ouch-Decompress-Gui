@@ -64,3 +64,5 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
 - Merge `develop` into `main` only when preparing a release, then push a tag
   `vX.Y.Z`. `.github/workflows/release.yml` builds the AppImages and creates the
   GitHub release.
+- Before tagging, bump `Cargo.toml` to the release version and add a matching
+  section to `CHANGELOG.md`; the release body is taken from that section.
