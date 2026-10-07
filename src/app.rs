@@ -590,6 +590,24 @@ impl App {
                 .load(std::sync::atomic::Ordering::Relaxed);
             crate::system::terminate_process(pid);
         }
+
+        if self.config.notify_on_done {
+            let running = self
+                .files
+                .iter()
+                .find(|file| file.status == Status::Running)
+                .and_then(|file| file.path.file_name())
+                .map(|name| name.to_string_lossy().into_owned());
+            let body = match running {
+                Some(name) => self
+                    .i18n
+                    .t("notify.incomplete.body")
+                    .replace("{file}", &name),
+                None => self.i18n.t("notify.incomplete.body.generic"),
+            };
+            crate::system::notify(&self.i18n.t("notify.incomplete.title"), &body);
+        }
+
         self.close_requested = true;
     }
 }
