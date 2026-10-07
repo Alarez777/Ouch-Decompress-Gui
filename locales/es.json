@@ -1,7 +1,7 @@
 {
   "app.title": "Ouch Decompress",
   "app.ouch_version": "ouch {version}",
-  "tab.log": "Registro",
+  "tab.log": "Log",
   "tab.settings": "Ajustes",
   "tab.about": "Acerca de",
   "extract.drop_hint": "Usa el botón \"Agregar archivos\"",
@@ -87,7 +87,7 @@
   "overwrite.body": "Los siguientes archivos ya existen. ¿Sobrescribirlos?",
   "overwrite.confirm": "Sobrescribir",
   "overwrite.skip": "Omitir este archivo",
-  "log.title": "Registro",
+  "log.title": "Log",
   "log.copy": "Copiar",
   "log.clear": "Limpiar registro",
   "log.empty": "El registro está vacío.",
