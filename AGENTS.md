@@ -52,6 +52,9 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
   upstream, because it makes the secondary windows unresponsive.
 - The bundled `ouch` is a static-PIE binary, so it must be copied into the
   AppDir *after* `linuxdeploy` runs (see `packaging/build-appimage.sh`).
+- Extraction progress is *estimated*: `ouch` exposes no progress, so the worker
+  polls the child's `/proc/<pid>/io` `rchar` and divides it by the archive size
+  (`src/job.rs`). Keep it best-effort and Linux-only.
 
 ## Branching and releases
 

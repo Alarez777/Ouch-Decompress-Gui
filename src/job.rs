@@ -6,10 +6,11 @@
 //! state directly.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
 use crate::formats;
@@ -39,6 +40,14 @@ pub enum JobEvent {
     NeedOverwrite {
         index: usize,
         conflicts: Vec<PathBuf>,
+    },
+    /// Approximate progress of the archive currently being extracted.
+    /// `fraction` is `0.0..=1.0`, computed from the bytes `ouch` has read from
+    /// the archive versus its size. `total == 0` means unknown.
+    Progress {
+        index: usize,
+        fraction: f32,
+        total: u64,
     },
     Done {
         index: usize,
@@ -154,6 +163,12 @@ fn process_one(
         };
     }
 
+    // Progress reporting is based on the bytes `ouch` reads from the archive,
+    // so it works even for a single huge file (where counting entries does
+    // not). The guard stops the poller when this function returns.
+    let pid_slot = Arc::new(AtomicU32::new(0));
+    let _progress = ProgressPoller::spawn(index, archive, pid_slot.clone(), event_tx, ctx);
+
     let is_archive = formats::is_archive_path(archive);
 
     if let Some(format) = formats::outer_format(archive) {
@@ -180,7 +195,7 @@ fn process_one(
             return fail(index, message);
         }
         let result = result_name(archive, false, None);
-        return match ouch.decompress(archive, Target::Here, None) {
+        return match ouch.decompress(archive, Target::Here, None, &pid_slot) {
             Ok(outcome) if outcome.success => {
                 finish_success(index, archive, "here", result, config, event_tx, ctx)
             }
@@ -276,7 +291,7 @@ fn process_one(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
-        match ouch.decompress(archive, target, candidate.as_deref()) {
+        match ouch.decompress(archive, target, candidate.as_deref(), &pid_slot) {
             Ok(outcome) if outcome.success => {
                 if candidate.is_some() {
                     *batch_password = candidate;
@@ -321,7 +336,7 @@ fn process_one(
         first_prompt = false;
         match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
             JobAnswer::Password(password) => {
-                match ouch.decompress(archive, target, Some(&password)) {
+                match ouch.decompress(archive, target, Some(&password), &pid_slot) {
                     Ok(outcome) if outcome.success => {
                         *batch_password = Some(password);
                         return finish_success(
@@ -651,6 +666,100 @@ fn is_password_error(message: &str) -> bool {
     message.contains("password") || message.contains("encrypt") || message.contains("decrypt")
 }
 
+/// Parses the `rchar` field (bytes read via syscalls) from `/proc/<pid>/io`.
+fn parse_rchar(contents: &str) -> Option<u64> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("rchar:")?.trim().parse::<u64>().ok())
+}
+
+/// Bytes read by the given process so far, from `/proc/<pid>/io`.
+fn process_read_bytes(pid: u32) -> Option<u64> {
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    parse_rchar(&contents)
+}
+
+/// Stops the progress poller thread when dropped.
+struct ProgressPoller {
+    stop_tx: Sender<()>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ProgressPoller {
+    /// Starts reporting progress for `archive`. Returns `None` when the archive
+    /// size is unknown, in which case the UI stays indeterminate.
+    fn spawn(
+        index: usize,
+        archive: &Path,
+        pid_slot: Arc<AtomicU32>,
+        event_tx: &Sender<JobEvent>,
+        ctx: &egui::Context,
+    ) -> Option<Self> {
+        let total = std::fs::metadata(archive).ok()?.len();
+        if total == 0 {
+            return None;
+        }
+        // Report the total right away so the UI shows a determinate bar even
+        // if the extraction finishes before the first poll.
+        let _ = event_tx.send(JobEvent::Progress {
+            index,
+            fraction: 0.0,
+            total,
+        });
+        ctx.request_repaint();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let event_tx = event_tx.clone();
+        let ctx = ctx.clone();
+        let handle = thread::spawn(move || {
+            run_progress_poller(index, total, pid_slot, event_tx, ctx, stop_rx);
+        });
+        Some(Self {
+            stop_tx,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for ProgressPoller {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Poller thread body: while `ouch` runs, reads the child's `/proc/<pid>/io`
+/// and reports `bytes_read / archive_size` as the progress fraction.
+fn run_progress_poller(
+    index: usize,
+    total: u64,
+    pid_slot: Arc<AtomicU32>,
+    event_tx: Sender<JobEvent>,
+    ctx: egui::Context,
+    stop_rx: Receiver<()>,
+) {
+    loop {
+        let pid = pid_slot.load(Ordering::Relaxed);
+        if pid != 0 {
+            if let Some(read) = process_read_bytes(pid) {
+                let fraction = (read as f64 / total as f64).min(1.0) as f32;
+                let _ = event_tx.send(JobEvent::Progress {
+                    index,
+                    fraction,
+                    total,
+                });
+                ctx.request_repaint();
+            }
+        }
+        match stop_rx.recv_timeout(Duration::from_millis(80)) {
+            Ok(()) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 enum SkipReason {
     Cancelled,
     BatchCancelled,
@@ -797,6 +906,13 @@ mod tests {
         assert!(!is_safe_relative_component("../evil"));
         assert!(!is_safe_relative_component("/abs"));
         assert!(!is_safe_relative_component("a/b"));
+    }
+
+    #[test]
+    fn parses_rchar_from_proc_io() {
+        assert_eq!(parse_rchar("rchar: 12345\nwchar: 678\n"), Some(12345));
+        assert_eq!(parse_rchar("wchar: 1\nsyscr: 2\n"), None);
+        assert_eq!(parse_rchar(""), None);
     }
 
     #[test]
