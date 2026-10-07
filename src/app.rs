@@ -1,7 +1,10 @@
 //! Application state and egui rendering.
 
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::thread;
 
 use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
 use crate::formats;
@@ -94,6 +97,11 @@ pub struct App {
     update_status: Option<crate::update::UpdateStatus>,
     /// Receiver for the in-flight update check.
     update_rx: Option<Receiver<crate::update::UpdateStatus>>,
+    /// Receiver for the in-flight native file picker.
+    file_picker_rx: Option<Receiver<Vec<PathBuf>>>,
+    /// PID of the running `zenity` file picker, or 0. Terminated on exit so it
+    /// does not outlive the window.
+    picker_pid: Arc<AtomicU32>,
     /// Set when a setting changed and the config still needs to be written.
     config_dirty: bool,
     /// Last time the config was written, used to debounce writes.
@@ -188,6 +196,8 @@ impl App {
             applied_scale: initial_scale,
             update_status: None,
             update_rx: None,
+            file_picker_rx: None,
+            picker_pid: Arc::new(AtomicU32::new(0)),
             config_dirty: false,
             last_config_save: None,
             scale_dragging: false,
@@ -331,6 +341,41 @@ impl App {
         if let Some(status) = result {
             self.update_status = Some(status);
             self.update_rx = None;
+        }
+    }
+
+    /// Opens the native file picker on a background thread, so the main window
+    /// keeps processing events (and the compositor does not flag it as "not
+    /// responding") while the dialog is open.
+    fn start_file_picker(&mut self, ctx: &egui::Context) {
+        if self.file_picker_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let pid_slot = self.picker_pid.clone();
+        thread::spawn(move || {
+            let files = crate::system::pick_files(&pid_slot);
+            if tx.send(files).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        self.file_picker_rx = Some(rx);
+    }
+
+    /// Receives the file-picker result, if it is ready.
+    fn pump_file_picker(&mut self, ctx: &egui::Context) {
+        let result = match &self.file_picker_rx {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        match result {
+            Ok(files) => {
+                self.file_picker_rx = None;
+                self.add_files_and_extract(ctx, files);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.file_picker_rx = None,
+            Err(mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -632,6 +677,7 @@ impl eframe::App for App {
 
         self.pump_events();
         self.pump_update();
+        self.pump_file_picker(&ctx);
         self.handle_dropped_files(&ctx);
 
         if self.restart_pending {
@@ -662,9 +708,12 @@ impl eframe::App for App {
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button(self.i18n.t("extract.add_file")).clicked() {
-                    let picked = crate::system::pick_files();
-                    self.add_files_and_extract(ui.ctx(), picked);
+                let picking = self.file_picker_rx.is_some();
+                if ui
+                    .add_enabled(!picking, egui::Button::new(self.i18n.t("extract.add_file")))
+                    .clicked()
+                {
+                    self.start_file_picker(ui.ctx());
                 }
                 if ui.button(self.i18n.t("tab.settings")).clicked() {
                     self.open_settings = true;
@@ -698,6 +747,11 @@ impl eframe::App for App {
         self.ui_close_confirm(&ctx);
         self.ui_error_modal(&ctx);
         self.draw_drop_overlay(&ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Do not let the file picker outlive the window.
+        crate::system::terminate_process(self.picker_pid.load(Ordering::Relaxed));
     }
 }
 
