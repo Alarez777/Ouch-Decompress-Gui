@@ -2,7 +2,8 @@
 //! avoid pulling in heavy D-Bus/GTK dependencies.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Opens a directory in the user's file manager via `xdg-open`.
 pub fn open_folder(path: &Path) {
@@ -52,10 +53,11 @@ pub fn notify(summary: &str, body: &str) {
 
 /// Opens a native multi-file picker through `zenity`.
 ///
-/// Returns an empty list when the user cancels or when `zenity` is not
-/// installed, in which case no files are added.
-pub fn pick_files() -> Vec<PathBuf> {
-    let output = Command::new("zenity")
+/// While the dialog is open, `pid_slot` holds zenity's PID (or 0), so the app
+/// can terminate it if it exits first. Returns an empty list when the user
+/// cancels or when `zenity` is not installed.
+pub fn pick_files(pid_slot: &AtomicU32) -> Vec<PathBuf> {
+    let child = Command::new("zenity")
         .args([
             "--file-selection",
             "--multiple",
@@ -63,7 +65,17 @@ pub fn pick_files() -> Vec<PathBuf> {
             "--title=Select archives",
             "--file-filter=Archives | *.tar *.tar.gz *.tgz *.tbz *.tbz2 *.txz *.tzst *.zip *.7z *.rar *.gz *.bz2 *.xz *.zst *.lz4",
         ])
-        .output();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+
+    let Ok(child) = child else {
+        return Vec::new();
+    };
+    pid_slot.store(child.id(), Ordering::Relaxed);
+    let output = child.wait_with_output();
+    pid_slot.store(0, Ordering::Relaxed);
 
     let Ok(output) = output else {
         return Vec::new();
