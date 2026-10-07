@@ -100,6 +100,37 @@ impl TrashFallback {
     }
 }
 
+/// When to show a desktop notification for a finished batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Notifications {
+    /// Notify after every batch.
+    #[default]
+    Always,
+    /// Only notify when a batch had failures or was interrupted.
+    OnFailure,
+    /// Never notify.
+    Never,
+}
+
+impl Notifications {
+    /// All variants in presentation order.
+    pub const ALL: [Notifications; 3] = [
+        Notifications::Always,
+        Notifications::OnFailure,
+        Notifications::Never,
+    ];
+
+    /// Translation key for the label.
+    pub fn label_key(&self) -> &'static str {
+        match self {
+            Notifications::Always => "notify.policy.always",
+            Notifications::OnFailure => "notify.policy.on_failure",
+            Notifications::Never => "notify.policy.never",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -126,8 +157,40 @@ pub struct Config {
     /// What to do when [`Self::after_extract`] is `Trash` but the archive
     /// cannot be moved to the trash.
     pub trash_fallback: TrashFallback,
-    /// Show a desktop notification when a batch finishes.
-    pub notify_on_done: bool,
+    /// When to show a desktop notification for a finished batch. The legacy
+    /// boolean key (`notify_on_done`) is still accepted when loading.
+    #[serde(
+        rename = "notifications",
+        alias = "notify_on_done",
+        default,
+        deserialize_with = "deserialize_notifications"
+    )]
+    pub notifications: Notifications,
+}
+
+/// Reads `notifications` from either the current string form or the legacy
+/// `notify_on_done` boolean.
+fn deserialize_notifications<'de, D>(deserializer: D) -> Result<Notifications, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Flag(bool),
+        Name(String),
+    }
+
+    Ok(match Repr::deserialize(deserializer)? {
+        Repr::Flag(true) => Notifications::Always,
+        Repr::Flag(false) => Notifications::Never,
+        Repr::Name(name) => match name.as_str() {
+            "always" => Notifications::Always,
+            "on_failure" => Notifications::OnFailure,
+            "never" => Notifications::Never,
+            _ => Notifications::default(),
+        },
+    })
 }
 
 impl Default for Config {
@@ -143,7 +206,7 @@ impl Default for Config {
             conflict_policy: ConflictPolicy::Ask,
             after_extract: AfterExtract::Trash,
             trash_fallback: TrashFallback::Delete,
-            notify_on_done: true,
+            notifications: Notifications::Always,
         }
     }
 }
@@ -228,5 +291,20 @@ mod tests {
         assert_eq!(loaded.passwords, vec!["secret".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_legacy_notify_flag() {
+        let config: Config = serde_json::from_str(r#"{"notify_on_done": false}"#).unwrap();
+        assert_eq!(config.notifications, Notifications::Never);
+
+        let config: Config = serde_json::from_str(r#"{"notify_on_done": true}"#).unwrap();
+        assert_eq!(config.notifications, Notifications::Always);
+
+        let config: Config = serde_json::from_str(r#"{"notifications": "on_failure"}"#).unwrap();
+        assert_eq!(config.notifications, Notifications::OnFailure);
+
+        let config: Config = serde_json::from_str(r#"{"notifications": "never"}"#).unwrap();
+        assert_eq!(config.notifications, Notifications::Never);
     }
 }
