@@ -1,4 +1,4 @@
-//! Ouch Decompress GUI: a lightweight Keka-like archive extractor for Linux.
+//! Ouch Decompress GUI: a lightweight GUI to extract archives on Linux.
 //!
 //! The binary doubles as the file-manager handler: when archive paths are
 //! passed on the command line (double-click / "Open with"), it extracts them

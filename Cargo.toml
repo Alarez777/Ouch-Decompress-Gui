@@ -1,9 +1,9 @@
 [package]
 name = "ouch-decompress-gui"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.85"
-description = "A simple Keka-like archive extractor for Linux, powered by ouch."
+description = "A lightweight GUI to extract archives on Linux, powered by ouch."
 authors = ["Alarez777"]
 license = "MIT"
 repository = "https://github.com/Alarez777/Ouch-Decompress-Gui"
