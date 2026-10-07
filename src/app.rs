@@ -227,7 +227,7 @@ impl App {
         };
 
         for path in initial_files {
-            app.add_file(path);
+            let _ = app.add_file(path);
         }
         if !app.files.is_empty() {
             app.request_start_batch(&cc.egui_ctx);
@@ -552,23 +552,21 @@ impl App {
 
     /// Adds an archive to the queue if it is not already present. For a
     /// multi-volume set the first volume is stored, so the set is queued only
-    /// once regardless of which part was passed in. Returns whether it was
-    /// added.
-    fn add_file(&mut self, path: PathBuf) -> bool {
+    /// once regardless of which part was passed in. Returns the stored path
+    /// when it was added.
+    fn add_file(&mut self, path: PathBuf) -> Option<PathBuf> {
         let parts = crate::split::archive_parts(&path);
-        let Some(primary) = parts.first().cloned() else {
-            return false;
-        };
+        let primary = parts.first()?.clone();
         if self.files.iter().any(|file| file.path == primary) {
-            return false;
+            return None;
         }
         self.files.push(FileEntry {
-            path: primary,
+            path: primary.clone(),
             parts,
             status: Status::Pending,
             message: String::new(),
         });
-        true
+        Some(primary)
     }
 
     /// Adds several paths, logs the ones that were new, and starts extracting
@@ -576,8 +574,8 @@ impl App {
     fn add_files_and_extract(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         let mut added = false;
         for path in paths {
-            if self.add_file(path.clone()) {
-                self.push_log(format!("+ {}", path.display()));
+            if let Some(stored) = self.add_file(path) {
+                self.push_log(format!("+ {}", stored.display()));
                 added = true;
             }
         }
