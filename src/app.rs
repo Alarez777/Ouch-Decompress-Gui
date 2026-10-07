@@ -78,6 +78,8 @@ pub struct App {
     i18n: I18n,
     ouch: Option<OuchClient>,
     ouch_error: Option<String>,
+    /// Decoded application logo, shown in the About window.
+    logo: Option<egui::TextureHandle>,
     /// Whether the independent settings window is open.
     open_settings: bool,
     /// Which tab is selected in the settings window.
@@ -156,6 +158,8 @@ impl App {
             Err(err) => (None, Some(err.to_string())),
         };
 
+        let logo = load_logo(&cc.egui_ctx);
+
         let auto_close_on_success = !initial_files.is_empty() && !open_settings;
         let initial_scale = config.ui_scale;
 
@@ -173,6 +177,7 @@ impl App {
             i18n,
             ouch,
             ouch_error,
+            logo,
             open_settings,
             settings_tab: SettingsTab::General,
             open_log: false,
@@ -870,8 +875,8 @@ impl App {
         let builder = egui::ViewportBuilder::default()
             .with_app_id("ouch-decompress-gui")
             .with_title(title)
-            .with_inner_size([380.0, 260.0])
-            .with_min_inner_size([380.0, 260.0]);
+            .with_inner_size([420.0, 470.0])
+            .with_min_inner_size([400.0, 430.0]);
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("about"),
             builder,
@@ -889,6 +894,12 @@ impl App {
 
     fn ui_about(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        if let Some(logo) = self.logo.clone() {
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Image::from_texture(&logo).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+            });
+            ui.add_space(6.0);
+        }
         ui.heading(self.i18n.t("app.title"));
         ui.label(
             egui::RichText::new(format!(
@@ -938,6 +949,18 @@ impl App {
         // Bundled tools (informational only).
         ui.label(self.i18n.t("about.components"));
         ui.label(self.ouch_version_label());
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // GUI toolkit used to build this app.
+        ui.label(self.i18n.t("about.interface"));
+        ui.label(format!(
+            "egui {} · eframe {}",
+            env!("EGUI_VERSION"),
+            env!("EFRAME_VERSION")
+        ));
 
         ui.add_space(10.0);
         ui.separator();
@@ -1546,8 +1569,21 @@ fn format_duration(total_secs: u64) -> String {
     format!("{minutes}:{seconds:02}")
 }
 
+/// Application logo, embedded in the binary for the About window.
+const LOGO_PNG: &[u8] = include_bytes!("../assets/ouch-decompress-gui-256.png");
+
+/// Decodes the embedded logo into an egui texture, if the PNG is valid.
+fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory_with_format(LOGO_PNG, image::ImageFormat::Png).ok()?;
+    let rgba = image.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+    Some(ctx.load_texture("app-logo", pixels, egui::TextureOptions::LINEAR))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -1581,5 +1617,32 @@ mod tests {
         });
         output.textures_delta.clear();
         assert_eq!(seen, 1, "dropped file should be visible in input.raw");
+    }
+
+    #[test]
+    fn embedded_logo_decodes() {
+        let image = image::load_from_memory_with_format(LOGO_PNG, image::ImageFormat::Png).unwrap();
+        assert!(image.width() >= 64 && image.height() >= 64);
+    }
+
+    #[test]
+    fn loads_logo_texture() {
+        let ctx = egui::Context::default();
+        assert!(load_logo(&ctx).is_some());
+    }
+
+    #[test]
+    fn gui_versions_are_injected() {
+        assert_ne!(env!("EGUI_VERSION"), "?");
+        assert_ne!(env!("EFRAME_VERSION"), "?");
+        assert!(!env!("EGUI_VERSION").is_empty());
+        assert!(!env!("EFRAME_VERSION").is_empty());
+    }
+
+    #[test]
+    fn formats_duration_as_minutes_and_seconds() {
+        assert_eq!(format_duration(0), "0:00");
+        assert_eq!(format_duration(65), "1:05");
+        assert_eq!(format_duration(3600), "60:00");
     }
 }

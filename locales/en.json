@@ -96,6 +96,7 @@
   "about.update_unknown": "Could not check for updates.",
   "about.project": "Project on GitHub",
   "about.components": "Bundled tools",
+  "about.interface": "Interface",
   "common.close": "Close",
   "common.cancel": "Cancel",
   "common.error": "Error",

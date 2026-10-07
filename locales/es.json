@@ -96,6 +96,7 @@
   "about.update_unknown": "No se pudieron comprobar las actualizaciones.",
   "about.project": "Proyecto en GitHub",
   "about.components": "Herramientas incluidas",
+  "about.interface": "Interfaz",
   "common.close": "Cerrar",
   "common.cancel": "Cancelar",
   "common.error": "Error",
