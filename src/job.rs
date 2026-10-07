@@ -262,6 +262,12 @@ fn process_one(
             if config.decompress_mode == DecompressMode::Smart {
                 let roots = modes::roots_from_listing(&text);
                 target = modes::choose_target(DecompressMode::Smart, true, &roots);
+                log_line(
+                    event_tx,
+                    ctx,
+                    index,
+                    format!("smart: {} root(s) -> {}", roots.len(), target.label()),
+                );
             }
             listing = Some(text);
         }
@@ -1148,6 +1154,107 @@ mod tests {
         config: &Config,
     ) -> (JobEvent, Vec<JobEvent>) {
         run_process_one_with(ouch, archive, config, &[JobAnswer::Skip, JobAnswer::Skip])
+    }
+
+    /// Builds a (possibly multi-volume) RAR with the `rar` tool and returns its
+    /// first part, or `None` when `rar` is not available.
+    fn build_multipart_rar(
+        dir: &Path,
+        inputs: &[&str],
+        base: &str,
+        volume: &str,
+    ) -> Option<PathBuf> {
+        let status = Command::new("rar")
+            .current_dir(dir)
+            .args(["a", "-idq", "-v", volume, "-m0", base])
+            .args(inputs)
+            .stdin(Stdio::null())
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        let stem = base.strip_suffix(".rar")?;
+        let first = dir.join(format!("{stem}.part1.rar"));
+        Some(if first.exists() {
+            first
+        } else {
+            dir.join(base)
+        })
+    }
+
+    #[test]
+    fn smart_single_root_multipart_extracts_here() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        let base = unique_dir("smart-multi-here");
+        std::fs::write(base.join("Payload.iso"), vec![7u8; 200_000]).unwrap();
+        let Some(archive) = build_multipart_rar(&base, &["Payload.iso"], "multi.rar", "100k")
+        else {
+            eprintln!("skipping: rar tool not found");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        std::fs::remove_file(base.join("Payload.iso")).unwrap();
+
+        let config = Config {
+            decompress_mode: DecompressMode::Smart,
+            conflict_policy: ConflictPolicy::Overwrite,
+            after_extract: AfterExtract::Keep,
+            ..Config::default()
+        };
+        let (event, _) = run_process_one(&ouch, &archive, &config);
+
+        assert!(
+            matches!(event, JobEvent::Done { success: true, .. }),
+            "event: {event:?}"
+        );
+        assert!(base.join("Payload.iso").exists(), "should extract here");
+        assert!(
+            !base.join("multi.part1").exists(),
+            "a single root must not create a wrapper folder"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn smart_multiple_roots_multipart_makes_a_folder() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        let base = unique_dir("smart-multi-folder");
+        std::fs::write(base.join("one.txt"), vec![1u8; 80_000]).unwrap();
+        std::fs::write(base.join("two.txt"), vec![2u8; 80_000]).unwrap();
+        let Some(archive) =
+            build_multipart_rar(&base, &["one.txt", "two.txt"], "multi.rar", "100k")
+        else {
+            eprintln!("skipping: rar tool not found");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        std::fs::remove_file(base.join("one.txt")).unwrap();
+        std::fs::remove_file(base.join("two.txt")).unwrap();
+
+        let config = Config {
+            decompress_mode: DecompressMode::Smart,
+            conflict_policy: ConflictPolicy::Overwrite,
+            after_extract: AfterExtract::Keep,
+            ..Config::default()
+        };
+        let (event, _) = run_process_one(&ouch, &archive, &config);
+
+        assert!(
+            matches!(event, JobEvent::Done { success: true, .. }),
+            "event: {event:?}"
+        );
+        assert!(
+            base.join("multi.part1").join("one.txt").exists(),
+            "multiple roots should create a folder"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
