@@ -130,6 +130,12 @@ pub struct App {
     results: Vec<String>,
     /// Set when a batch finished but more files were added meanwhile.
     restart_pending: bool,
+    /// Progress of the archive currently being extracted:
+    /// `(fraction, total_bytes)`. `total == 0` means unknown, so the bar is
+    /// shown as indeterminate.
+    progress: (f32, u64),
+    /// When the current batch started, for the elapsed-time label.
+    batch_started: Option<std::time::Instant>,
 }
 
 impl App {
@@ -197,6 +203,8 @@ impl App {
             cleanup_failures: 0,
             results: Vec::new(),
             restart_pending: false,
+            progress: (0.0, 0),
+            batch_started: None,
         };
 
         if !app.files.is_empty() {
@@ -260,6 +268,8 @@ impl App {
         self.error_popup = None;
         self.cleanup_failures = 0;
         self.results.clear();
+        self.progress = (0.0, 0);
+        self.batch_started = Some(std::time::Instant::now());
 
         let archives: Vec<PathBuf> = pending
             .iter()
@@ -322,11 +332,23 @@ impl App {
                     self.files[file_index].status = Status::Running;
                     self.push_log(format!("-> {}", self.file_name(file_index)));
                 }
+                self.progress = (0.0, 0);
                 self.status_line = self.i18n.t("extract.working");
             }
             JobEvent::Log { index, line } => {
                 let _ = index;
                 self.push_log(line);
+            }
+            JobEvent::Progress {
+                index,
+                fraction,
+                total,
+            } => {
+                if let Some(file_index) = self.file_index(index) {
+                    if self.files[file_index].status == Status::Running {
+                        self.progress = (fraction, total);
+                    }
+                }
             }
             JobEvent::NeedPassword {
                 index,
@@ -383,6 +405,9 @@ impl App {
                         }
                     }
                 }
+                if success && self.progress.1 > 0 {
+                    self.progress.0 = 1.0;
+                }
                 self.push_log(format!("   {message}"));
                 if let Some(result) = result {
                     self.results.push(result);
@@ -396,6 +421,8 @@ impl App {
                 self.running = false;
                 self.controller = None;
                 self.event_rx = None;
+                self.progress = (0.0, 0);
+                self.batch_started = None;
                 self.status_line = self.i18n.t("extract.all_done");
 
                 if self.config.notify_on_done {
@@ -654,10 +681,45 @@ impl App {
         }
 
         if self.running {
+            let name = self
+                .files
+                .iter()
+                .find(|file| file.status == Status::Running)
+                .and_then(|file| file.path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.status_line_line());
+            let elapsed = self
+                .batch_started
+                .map(|started| started.elapsed().as_secs());
+            let mut cancel_clicked = false;
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(self.status_line_line());
+                ui.add(egui::Label::new(name).truncate());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(self.i18n.t("common.cancel")).clicked() {
+                        cancel_clicked = true;
+                    }
+                    if let Some(secs) = elapsed {
+                        ui.label(
+                            egui::RichText::new(
+                                self.i18n
+                                    .t("progress.elapsed")
+                                    .replace("{time}", &format_duration(secs)),
+                            )
+                            .color(egui::Color32::GRAY),
+                        );
+                    }
+                });
             });
+            if cancel_clicked {
+                self.cancel_batch();
+            }
+
+            let (fraction, total) = self.progress;
+            if total > 0 {
+                ui.add(egui::ProgressBar::new(fraction).text(format!("{:.0}%", fraction * 100.0)));
+            } else {
+                ui.add(egui::ProgressBar::new(0.0).animate(true));
+            }
         } else if !self.status_line.is_empty() {
             ui.label(self.status_line.clone());
         }
@@ -1475,6 +1537,13 @@ impl App {
                 });
             });
     }
+}
+
+/// Formats a number of seconds as `M:SS`.
+fn format_duration(total_secs: u64) -> String {
+    let minutes = total_secs / 60;
+    let seconds = total_secs % 60;
+    format!("{minutes}:{seconds:02}")
 }
 
 #[cfg(test)]

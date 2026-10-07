@@ -7,6 +7,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::modes::Target;
 
@@ -122,11 +123,15 @@ impl OuchClient {
     /// The working directory is set to the archive's parent so that ouch's
     /// native "stem folder" and `--here` behaviors land next to the archive
     /// regardless of where the app was launched from.
+    ///
+    /// While the child runs, `pid_slot` holds its PID (or 0), so the progress
+    /// poller can read the child's `/proc/<pid>/io`.
     pub fn decompress(
         &self,
         archive: &Path,
         target: Target,
         password: Option<&str>,
+        pid_slot: &AtomicU32,
     ) -> Result<DecompressOutcome> {
         let workdir = archive
             .parent()
@@ -144,10 +149,20 @@ impl OuchClient {
             cmd.arg("-p").arg(password);
         }
         cmd.arg(archive);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        // Publish the child PID so the progress poller can read `/proc/<pid>/io`
+        // while the extraction runs.
+        let child = cmd
+            .spawn()
             .with_context(|| format!("running `ouch decompress` for {}", archive.display()))?;
+        pid_slot.store(child.id(), Ordering::Relaxed);
+        let output = child.wait_with_output();
+        // Always clear the PID, even if waiting failed, so a stale PID is
+        // never left for the poller (which could then read the wrong process).
+        pid_slot.store(0, Ordering::Relaxed);
+        let output =
+            output.with_context(|| format!("waiting for `ouch` on {}", archive.display()))?;
 
         Ok(DecompressOutcome {
             success: output.status.success(),
@@ -265,7 +280,9 @@ mod tests {
             Target::Folder
         );
 
-        let outcome = ouch.decompress(&multi, Target::Folder, None).unwrap();
+        let outcome = ouch
+            .decompress(&multi, Target::Folder, None, &AtomicU32::new(0))
+            .unwrap();
         assert!(outcome.success, "decompress failed: {}", outcome.stderr);
         assert!(multi_dir.join("multi/a.txt").exists());
         assert!(multi_dir.join("multi/sub/b.txt").exists());
@@ -285,7 +302,9 @@ mod tests {
             Target::Here
         );
 
-        let outcome = ouch.decompress(&single, Target::Here, None).unwrap();
+        let outcome = ouch
+            .decompress(&single, Target::Here, None, &AtomicU32::new(0))
+            .unwrap();
         assert!(outcome.success, "decompress failed: {}", outcome.stderr);
         assert!(single_dir.join("source/one/file.txt").exists());
 
