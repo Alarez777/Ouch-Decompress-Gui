@@ -6,6 +6,10 @@
 A lightweight, Keka-like **archive extractor** for Linux, written in **Rust**
 and powered by [ouch](https://github.com/ouch-org/ouch).
 
+> **Independent, unofficial project.** This app is **not** developed, endorsed or
+> maintained by the `ouch` authors. It is an independent GUI that simply runs
+> the `ouch` command-line tool.
+
 **This app only decompresses.** It is deliberately focused on extraction;
 creating or editing archives is out of scope.
 
@@ -178,6 +182,9 @@ The result is written to `dist/Ouch-Decompress-Gui-<arch>.AppImage`.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+This project is independent from and not affiliated with the
+[`ouch`](https://github.com/ouch-org/ouch) project or its authors.
 
 `ouch` is distributed under the MIT license; RAR support relies on the
 non-free `unrar` library, so builds including RAR cannot be relicensed as
