@@ -16,6 +16,7 @@ use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
 use crate::formats;
 use crate::modes::{self, DecompressMode, Target};
 use crate::ouch::OuchClient;
+use crate::split;
 
 /// Events sent from the worker to the UI.
 #[derive(Debug, Clone)]
@@ -43,11 +44,13 @@ pub enum JobEvent {
     },
     /// Approximate progress of the archive currently being extracted.
     /// `fraction` is `0.0..=1.0`, computed from the bytes `ouch` has read from
-    /// the archive versus its size. `total == 0` means unknown.
+    /// the archive versus its total size. For a multi-volume set `part_index`
+    /// is the volume being read. `total == 0` means unknown.
     Progress {
         index: usize,
         fraction: f32,
         total: u64,
+        part_index: usize,
     },
     Done {
         index: usize,
@@ -181,11 +184,15 @@ fn process_one(
         };
     }
 
+    // Every file of a multi-volume set, for the post-extraction cleanup.
+    let cleanup_parts = split::archive_parts(archive);
+
     // Progress reporting is based on the bytes `ouch` reads from the archive,
     // so it works even for a single huge file (where counting entries does
     // not). The guard stops the poller when this function returns. `current_pid`
     // is shared with the UI so it can kill the child if the user closes.
-    let _progress = ProgressPoller::spawn(index, archive, current_pid.clone(), event_tx, ctx);
+    let _progress =
+        ProgressPoller::spawn(index, &cleanup_parts, current_pid.clone(), event_tx, ctx);
 
     let is_archive = formats::is_archive_path(archive);
 
@@ -214,9 +221,16 @@ fn process_one(
         }
         let result = result_name(archive, false, None);
         return match ouch.decompress(archive, Target::Here, None, current_pid) {
-            Ok(outcome) if outcome.success => {
-                finish_success(index, archive, "here", result, config, event_tx, ctx)
-            }
+            Ok(outcome) if outcome.success => finish_success(
+                index,
+                archive,
+                &cleanup_parts,
+                "here",
+                result,
+                config,
+                event_tx,
+                ctx,
+            ),
             Ok(outcome) => fail(index, outcome_message(&outcome)),
             Err(err) => fail(index, err.to_string()),
         };
@@ -317,6 +331,7 @@ fn process_one(
                 return finish_success(
                     index,
                     archive,
+                    &cleanup_parts,
                     target.label(),
                     result.clone(),
                     config,
@@ -360,6 +375,7 @@ fn process_one(
                         return finish_success(
                             index,
                             archive,
+                            &cleanup_parts,
                             target.label(),
                             result.clone(),
                             config,
@@ -533,80 +549,89 @@ fn find_available_renamed(path: &Path) -> PathBuf {
     parent.join(format!("{file_name}_copy"))
 }
 
-/// Applies the configured post-extraction action to the source archive, then
+/// Applies the configured post-extraction action to every source part and
+/// returns the last error, if any.
+fn cleanup_sources(
+    parts: &[PathBuf],
+    config: &Config,
+    event_tx: &Sender<JobEvent>,
+    ctx: &egui::Context,
+    index: usize,
+) -> Option<String> {
+    let mut error = None;
+    for path in parts {
+        let result = match config.after_extract {
+            AfterExtract::Keep => continue,
+            AfterExtract::Delete => match std::fs::remove_file(path) {
+                Ok(()) => {
+                    log_line(event_tx, ctx, index, format!("removed {}", path.display()));
+                    Ok(())
+                }
+                Err(err) => Err(format!("could not delete {}: {err}", path.display())),
+            },
+            AfterExtract::Trash => {
+                if crate::system::trash_file(path) {
+                    log_line(
+                        event_tx,
+                        ctx,
+                        index,
+                        format!("moved to trash: {}", path.display()),
+                    );
+                    Ok(())
+                } else {
+                    // No usable trash (e.g. a filesystem without a trash dir).
+                    match config.trash_fallback {
+                        TrashFallback::Delete => match std::fs::remove_file(path) {
+                            Ok(()) => {
+                                log_line(
+                                    event_tx,
+                                    ctx,
+                                    index,
+                                    format!("no trash: deleted {}", path.display()),
+                                );
+                                Ok(())
+                            }
+                            Err(err) => Err(format!(
+                                "could not delete {} (no trash and no permission): {err}",
+                                path.display()
+                            )),
+                        },
+                        // The user asked not to be warned when set to do nothing.
+                        TrashFallback::Nothing => {
+                            log_line(
+                                event_tx,
+                                ctx,
+                                index,
+                                format!("no trash available; kept {}", path.display()),
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        };
+        if let Err(message) = result {
+            log_line(event_tx, ctx, index, message.clone());
+            error = Some(message);
+        }
+    }
+    error
+}
+
+/// Applies the configured post-extraction action to every source part, then
 /// builds the success event.
+#[allow(clippy::too_many_arguments)]
 fn finish_success(
     index: usize,
     archive: &Path,
+    parts: &[PathBuf],
     target_label: &str,
     result: Option<String>,
     config: &Config,
     event_tx: &Sender<JobEvent>,
     ctx: &egui::Context,
 ) -> JobEvent {
-    let cleanup_error = match config.after_extract {
-        AfterExtract::Keep => None,
-        AfterExtract::Delete => match std::fs::remove_file(archive) {
-            Ok(()) => {
-                log_line(
-                    event_tx,
-                    ctx,
-                    index,
-                    format!("removed {}", archive.display()),
-                );
-                None
-            }
-            Err(err) => {
-                let message = format!("could not delete {}: {err}", archive.display());
-                log_line(event_tx, ctx, index, message.clone());
-                Some(message)
-            }
-        },
-        AfterExtract::Trash => {
-            if crate::system::trash_file(archive) {
-                log_line(
-                    event_tx,
-                    ctx,
-                    index,
-                    format!("moved to trash: {}", archive.display()),
-                );
-                None
-            } else {
-                // No usable trash (e.g. a filesystem without a trash directory).
-                match config.trash_fallback {
-                    TrashFallback::Delete => match std::fs::remove_file(archive) {
-                        Ok(()) => {
-                            log_line(
-                                event_tx,
-                                ctx,
-                                index,
-                                format!("no trash: deleted {}", archive.display()),
-                            );
-                            None
-                        }
-                        Err(err) => {
-                            let message = format!(
-                                "could not delete {} (no trash and no permission): {err}",
-                                archive.display()
-                            );
-                            log_line(event_tx, ctx, index, message.clone());
-                            Some(message)
-                        }
-                    },
-                    // The user asked not to be warned when set to do nothing.
-                    TrashFallback::Nothing => {
-                        log_line(
-                            event_tx,
-                            ctx,
-                            index,
-                            format!("no trash available; kept {}", archive.display()),
-                        );
-                        None
-                    }
-                }
-            }
-        }
-    };
+    let cleanup_error = cleanup_sources(parts, config, event_tx, ctx, index);
 
     let archive_name = archive
         .file_name()
@@ -704,16 +729,23 @@ struct ProgressPoller {
 }
 
 impl ProgressPoller {
-    /// Starts reporting progress for `archive`. Returns `None` when the archive
-    /// size is unknown, in which case the UI stays indeterminate.
+    /// Starts reporting progress for the given parts. Returns `None` when the
+    /// total size is unknown, in which case the UI stays indeterminate.
     fn spawn(
         index: usize,
-        archive: &Path,
+        parts: &[PathBuf],
         pid_slot: Arc<AtomicU32>,
         event_tx: &Sender<JobEvent>,
         ctx: &egui::Context,
     ) -> Option<Self> {
-        let total = std::fs::metadata(archive).ok()?.len();
+        let mut cumulative = Vec::with_capacity(parts.len());
+        let mut total = 0u64;
+        for part in parts {
+            total += std::fs::metadata(part)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            cumulative.push(total);
+        }
         if total == 0 {
             return None;
         }
@@ -723,13 +755,14 @@ impl ProgressPoller {
             index,
             fraction: 0.0,
             total,
+            part_index: 0,
         });
         ctx.request_repaint();
         let (stop_tx, stop_rx) = mpsc::channel();
         let event_tx = event_tx.clone();
         let ctx = ctx.clone();
         let handle = thread::spawn(move || {
-            run_progress_poller(index, total, pid_slot, event_tx, ctx, stop_rx);
+            run_progress_poller(index, total, cumulative, pid_slot, event_tx, ctx, stop_rx);
         });
         Some(Self {
             stop_tx,
@@ -748,10 +781,11 @@ impl Drop for ProgressPoller {
 }
 
 /// Poller thread body: while `ouch` runs, reads the child's `/proc/<pid>/io`
-/// and reports `bytes_read / archive_size` as the progress fraction.
+/// and reports `bytes_read / total_size` as the progress fraction.
 fn run_progress_poller(
     index: usize,
     total: u64,
+    cumulative: Vec<u64>,
     pid_slot: Arc<AtomicU32>,
     event_tx: Sender<JobEvent>,
     ctx: egui::Context,
@@ -762,10 +796,12 @@ fn run_progress_poller(
         if pid != 0 {
             if let Some(read) = process_read_bytes(pid) {
                 let fraction = (read as f64 / total as f64).min(1.0) as f32;
+                let part_index = part_index_for(read, &cumulative);
                 let _ = event_tx.send(JobEvent::Progress {
                     index,
                     fraction,
                     total,
+                    part_index,
                 });
                 ctx.request_repaint();
             }
@@ -776,6 +812,15 @@ fn run_progress_poller(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+/// Index of the part that contains byte `read`, given the cumulative byte
+/// ends of every part.
+fn part_index_for(read: u64, cumulative: &[u64]) -> usize {
+    cumulative
+        .iter()
+        .position(|end| read < *end)
+        .unwrap_or_else(|| cumulative.len().saturating_sub(1))
 }
 
 enum SkipReason {
@@ -931,6 +976,41 @@ mod tests {
         assert_eq!(parse_rchar("rchar: 12345\nwchar: 678\n"), Some(12345));
         assert_eq!(parse_rchar("wchar: 1\nsyscr: 2\n"), None);
         assert_eq!(parse_rchar(""), None);
+    }
+
+    #[test]
+    fn maps_read_bytes_to_part_index() {
+        let cumulative = [100, 250, 300];
+        assert_eq!(part_index_for(0, &cumulative), 0);
+        assert_eq!(part_index_for(99, &cumulative), 0);
+        assert_eq!(part_index_for(100, &cumulative), 1);
+        assert_eq!(part_index_for(249, &cumulative), 1);
+        assert_eq!(part_index_for(250, &cumulative), 2);
+        assert_eq!(part_index_for(999, &cumulative), 2);
+        assert_eq!(part_index_for(5, &[]), 0);
+    }
+
+    #[test]
+    fn deletes_every_part_after_extraction() {
+        let base = unique_dir("cleanup");
+        let parts: Vec<PathBuf> = (1..=3)
+            .map(|number| base.join(format!("movie.part{number}.rar")))
+            .collect();
+        for part in &parts {
+            std::fs::write(part, b"x").unwrap();
+        }
+
+        let config = Config {
+            after_extract: AfterExtract::Delete,
+            ..Config::default()
+        };
+        let (tx, _rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+
+        let error = cleanup_sources(&parts, &config, &tx, &ctx, 0);
+        assert!(error.is_none());
+        assert!(parts.iter().all(|part| !part.exists()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

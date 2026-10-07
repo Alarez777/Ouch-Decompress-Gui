@@ -57,6 +57,8 @@ impl Status {
 /// One queued archive.
 struct FileEntry {
     path: PathBuf,
+    /// All parts when this is a multi-volume archive (just the file otherwise).
+    parts: Vec<PathBuf>,
     status: Status,
     message: String,
 }
@@ -144,9 +146,9 @@ pub struct App {
     /// Set when a batch finished but more files were added meanwhile.
     restart_pending: bool,
     /// Progress of the archive currently being extracted:
-    /// `(fraction, total_bytes)`. `total == 0` means unknown, so the bar is
-    /// shown as indeterminate.
-    progress: (f32, u64),
+    /// `(fraction, total_bytes, part_index)`. `total == 0` means unknown, so
+    /// the bar is shown as indeterminate.
+    progress: (f32, u64, usize),
     /// When the current batch started, for the elapsed-time label.
     batch_started: Option<std::time::Instant>,
 }
@@ -178,15 +180,6 @@ impl App {
         let auto_close_on_success = !initial_files.is_empty() && !open_settings;
         let initial_scale = config.ui_scale;
 
-        let files: Vec<FileEntry> = initial_files
-            .into_iter()
-            .map(|path| FileEntry {
-                path,
-                status: Status::Pending,
-                message: String::new(),
-            })
-            .collect();
-
         let mut app = Self {
             config,
             i18n,
@@ -205,7 +198,7 @@ impl App {
             config_dirty: false,
             last_config_save: None,
             scale_dragging: false,
-            files,
+            files: Vec::new(),
             log: Vec::new(),
             status_line: String::new(),
             running: false,
@@ -226,10 +219,13 @@ impl App {
             cleanup_failures: 0,
             results: Vec::new(),
             restart_pending: false,
-            progress: (0.0, 0),
+            progress: (0.0, 0, 0),
             batch_started: None,
         };
 
+        for path in initial_files {
+            app.add_file(path);
+        }
         if !app.files.is_empty() {
             app.request_start_batch(&cc.egui_ctx);
         }
@@ -291,7 +287,7 @@ impl App {
         self.error_popup = None;
         self.cleanup_failures = 0;
         self.results.clear();
-        self.progress = (0.0, 0);
+        self.progress = (0.0, 0, 0);
         self.batch_started = Some(std::time::Instant::now());
 
         let archives: Vec<PathBuf> = pending
@@ -390,7 +386,7 @@ impl App {
                     self.files[file_index].status = Status::Running;
                     self.push_log(format!("-> {}", self.file_name(file_index)));
                 }
-                self.progress = (0.0, 0);
+                self.progress = (0.0, 0, 0);
                 self.status_line = self.i18n.t("extract.working");
             }
             JobEvent::Log { index, line } => {
@@ -401,10 +397,11 @@ impl App {
                 index,
                 fraction,
                 total,
+                part_index,
             } => {
                 if let Some(file_index) = self.file_index(index) {
                     if self.files[file_index].status == Status::Running {
-                        self.progress = (fraction, total);
+                        self.progress = (fraction, total, part_index);
                     }
                 }
             }
@@ -479,7 +476,7 @@ impl App {
                 self.running = false;
                 self.controller = None;
                 self.event_rx = None;
-                self.progress = (0.0, 0);
+                self.progress = (0.0, 0, 0);
                 self.batch_started = None;
                 self.confirm_close = false;
                 self.status_line = self.i18n.t("extract.all_done");
@@ -549,14 +546,21 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Adds a path to the queue if it is not already present. Returns whether
-    /// it was actually added.
+    /// Adds an archive to the queue if it is not already present. For a
+    /// multi-volume set the first volume is stored, so the set is queued only
+    /// once regardless of which part was passed in. Returns whether it was
+    /// added.
     fn add_file(&mut self, path: PathBuf) -> bool {
-        if self.files.iter().any(|file| file.path == path) {
+        let parts = crate::split::archive_parts(&path);
+        let Some(primary) = parts.first().cloned() else {
+            return false;
+        };
+        if self.files.iter().any(|file| file.path == primary) {
             return false;
         }
         self.files.push(FileEntry {
-            path,
+            path: primary,
+            parts,
             status: Status::Pending,
             message: String::new(),
         });
@@ -793,19 +797,29 @@ impl App {
         }
 
         if self.running {
-            let name = self
+            let (fraction, total, _) = self.progress;
+            let running = self
                 .files
                 .iter()
-                .find(|file| file.status == Status::Running)
+                .find(|file| file.status == Status::Running);
+            let name = running
                 .and_then(|file| file.path.file_name())
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| self.status_line_line());
+            let parts = running.map_or(0, |file| file.parts.len());
             let elapsed = self
                 .batch_started
                 .map(|started| started.elapsed().as_secs());
             let mut cancel_clicked = false;
             ui.horizontal(|ui| {
                 ui.add(egui::Label::new(name).truncate());
+                if parts > 1 {
+                    let hint = self
+                        .i18n
+                        .t("extract.parts")
+                        .replace("{count}", &parts.to_string());
+                    ui.label(egui::RichText::new(hint).small().color(egui::Color32::GRAY));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(self.i18n.t("common.cancel")).clicked() {
                         cancel_clicked = true;
@@ -826,7 +840,6 @@ impl App {
                 self.cancel_batch();
             }
 
-            let (fraction, total) = self.progress;
             if total > 0 {
                 ui.add(egui::ProgressBar::new(fraction).text(format!("{:.0}%", fraction * 100.0)));
             } else {
@@ -846,6 +859,8 @@ impl App {
                 );
             });
         } else {
+            // Volume currently being read, shown next to the running entry.
+            let running_part = self.progress.2;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -858,13 +873,47 @@ impl App {
                                     .color(file.status.color())
                                     .small(),
                             );
-                            let name = file
-                                .path
+                            let multipart = file.parts.len() > 1;
+                            // While a multi-volume set is running, show the part
+                            // being read now, next to "Running".
+                            let current = if file.status == Status::Running && multipart {
+                                let part_index = running_part.min(file.parts.len() - 1);
+                                Some((part_index, &file.parts[part_index]))
+                            } else {
+                                None
+                            };
+                            let shown = current.map_or(&file.path, |(_, part)| part);
+                            let name = shown
                                 .file_name()
                                 .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| file.path.display().to_string());
-                            ui.label(name)
-                                .on_hover_text(file.path.display().to_string());
+                                .unwrap_or_else(|| shown.display().to_string());
+                            ui.label(name).on_hover_text(shown.display().to_string());
+                            if let Some((part_index, _)) = current {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}/{}",
+                                        part_index + 1,
+                                        file.parts.len()
+                                    ))
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                                );
+                            } else if multipart {
+                                let hint = self
+                                    .i18n
+                                    .t("extract.parts")
+                                    .replace("{count}", &file.parts.len().to_string());
+                                ui.label(
+                                    egui::RichText::new(hint).small().color(egui::Color32::GRAY),
+                                )
+                                .on_hover_text(
+                                    file.parts
+                                        .iter()
+                                        .map(|part| part.display().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                );
+                            }
                             if file.status == Status::Failed && !file.message.is_empty() {
                                 ui.label(
                                     egui::RichText::new(&file.message)
