@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
 
-use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
+use crate::config::{AfterExtract, Config, ConflictPolicy, Notifications, TrashFallback};
 use crate::formats;
 use crate::i18n::I18n;
 use crate::job::{self, JobAnswer, JobController, JobEvent};
@@ -485,22 +485,38 @@ impl App {
                 self.confirm_close = false;
                 self.status_line = self.i18n.t("extract.all_done");
 
-                if self.config.notify_on_done {
-                    let done = self
-                        .files
-                        .iter()
-                        .filter(|file| file.status == Status::Done)
-                        .count();
-                    let failed = self
-                        .files
-                        .iter()
-                        .filter(|file| file.status == Status::Failed)
-                        .count();
-                    let mut body = self
-                        .i18n
-                        .t("notify.done.body")
-                        .replace("{done}", &done.to_string())
-                        .replace("{failed}", &failed.to_string());
+                let done = self
+                    .files
+                    .iter()
+                    .filter(|file| file.status == Status::Done)
+                    .count();
+                let failed = self
+                    .files
+                    .iter()
+                    .filter(|file| file.status == Status::Failed)
+                    .count();
+                let notify = match self.config.notifications {
+                    // Nothing was processed (all skipped): stay quiet.
+                    Notifications::Always => done > 0 || failed > 0,
+                    Notifications::OnFailure => failed > 0,
+                    Notifications::Never => false,
+                };
+                if notify {
+                    // Only mention the failures when there are any.
+                    let mut body = if failed == 0 {
+                        self.i18n
+                            .t("notify.done.ok")
+                            .replace("{done}", &done.to_string())
+                    } else if done == 0 {
+                        self.i18n
+                            .t("notify.done.failed")
+                            .replace("{failed}", &failed.to_string())
+                    } else {
+                        self.i18n
+                            .t("notify.done.body")
+                            .replace("{done}", &done.to_string())
+                            .replace("{failed}", &failed.to_string())
+                    };
                     if !self.results.is_empty() {
                         body.push('\n');
                         body.push_str(&self.results.join("\n"));
@@ -646,7 +662,9 @@ impl App {
             crate::system::terminate_process(pid);
         }
 
-        if self.config.notify_on_done {
+        // An interrupted extraction counts as a failure, so it is notified
+        // unless notifications are disabled entirely.
+        if self.config.notifications != Notifications::Never {
             let running = self
                 .files
                 .iter()
@@ -1357,13 +1375,23 @@ impl App {
 
         ui.add_space(12.0);
         ui.separator();
-        if ui
-            .checkbox(
-                &mut self.config.notify_on_done,
-                self.i18n.t("settings.notify"),
-            )
-            .changed()
-        {
+        ui.label(egui::RichText::new(self.i18n.t("settings.notify")).strong());
+        let mut changed = false;
+        egui::ComboBox::from_id_salt("notify-combo")
+            .selected_text(self.i18n.t(self.config.notifications.label_key()))
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                for option in Notifications::ALL {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.config.notifications,
+                            option,
+                            self.i18n.t(option.label_key()),
+                        )
+                        .changed();
+                }
+            });
+        if changed {
             self.persist();
         }
 
