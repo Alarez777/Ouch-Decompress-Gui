@@ -187,6 +187,9 @@ fn process_one(
     // Every file of a multi-volume set, for the post-extraction cleanup.
     let cleanup_parts = split::archive_parts(archive);
 
+    // Logs each `ouch` command as it runs.
+    let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
+
     // Progress reporting is based on the bytes `ouch` reads from the archive,
     // so it works even for a single huge file (where counting entries does
     // not). The guard stops the poller when this function returns. `current_pid`
@@ -220,7 +223,7 @@ fn process_one(
             return fail(index, message);
         }
         let result = result_name(archive, false, None);
-        return match ouch.decompress(archive, Target::Here, None, current_pid) {
+        return match ouch.decompress(archive, Target::Here, None, current_pid, &log) {
             Ok(outcome) if outcome.success => finish_success(
                 index,
                 archive,
@@ -329,7 +332,7 @@ fn process_one(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
-        match ouch.decompress(archive, target, candidate.as_deref(), current_pid) {
+        match ouch.decompress(archive, target, candidate.as_deref(), current_pid, &log) {
             Ok(outcome) if outcome.success => {
                 if candidate.is_some() {
                     *batch_password = candidate;
@@ -375,7 +378,7 @@ fn process_one(
         first_prompt = false;
         match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
             JobAnswer::Password(password) => {
-                match ouch.decompress(archive, target, Some(&password), current_pid) {
+                match ouch.decompress(archive, target, Some(&password), current_pid, &log) {
                     Ok(outcome) if outcome.success => {
                         *batch_password = Some(password);
                         return finish_success(
@@ -852,6 +855,7 @@ fn obtain_listing(
     index: usize,
     ctx: &egui::Context,
 ) -> Result<(String, Option<String>), SkipReason> {
+    let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
     let mut candidates: Vec<Option<String>> = vec![None];
     if let Some(batch) = batch_password.clone() {
         candidates.push(Some(batch));
@@ -868,7 +872,7 @@ fn obtain_listing(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
-        match ouch.list(archive, candidate.as_deref()) {
+        match ouch.list(archive, candidate.as_deref(), &log) {
             Ok(listing) => {
                 if candidate.is_some() {
                     *batch_password = candidate.clone();
@@ -903,7 +907,7 @@ fn obtain_listing(
 
         let answer = answer_rx.recv().unwrap_or(JobAnswer::CancelBatch);
         match answer {
-            JobAnswer::Password(password) => match ouch.list(archive, Some(&password)) {
+            JobAnswer::Password(password) => match ouch.list(archive, Some(&password), &log) {
                 Ok(listing) => {
                     *batch_password = Some(password);
                     return Ok((listing, batch_password.clone()));

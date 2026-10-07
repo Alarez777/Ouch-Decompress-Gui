@@ -98,24 +98,46 @@ impl OuchClient {
     /// `-A` disables colors and `-q` suppresses the `Archive:` header, which
     /// makes the output easy to parse. Fails for non-archive formats and for
     /// encrypted archives when the password is wrong or missing.
-    pub fn list(&self, archive: &Path, password: Option<&str>) -> Result<String> {
-        let mut cmd = self.command();
-        cmd.arg("list").arg("-A").arg("-q");
-        if let Some(password) = password {
-            cmd.arg("-p").arg(password);
-        }
-        cmd.arg(archive);
+    pub fn list(
+        &self,
+        archive: &Path,
+        password: Option<&str>,
+        log: &dyn Fn(&str),
+    ) -> Result<String> {
+        let run = |extra: &[&str]| {
+            let mut cmd = self.command();
+            cmd.arg("list");
+            cmd.args(extra);
+            if let Some(password) = password {
+                cmd.arg("-p").arg(password);
+            }
+            cmd.arg(archive);
+            log(&describe_command(&cmd));
+            cmd.output()
+        };
+        let stdout_of =
+            |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).into_owned();
 
-        let output = cmd
-            .output()
+        let result = run(&["-A", "-q"])
             .with_context(|| format!("running `ouch list` for {}", archive.display()))?;
-        if !output.status.success() {
-            bail!(
-                "ouch list failed: {}",
-                stderr_or_stdout(&output.stderr, &output.stdout)
-            );
+        if result.status.success() {
+            return Ok(stdout_of(&result));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+
+        // Some archives make `ouch list -A -q` crash (e.g. multi-volume RAR);
+        // the plain listing usually still works and its header is ignored when
+        // parsing.
+        if let Ok(fallback) = run(&[]) {
+            if fallback.status.success() {
+                return Ok(stdout_of(&fallback));
+            }
+        }
+
+        let mut detail = stderr_or_stdout(&result.stderr, &result.stdout);
+        if detail.is_empty() {
+            detail = result.status.to_string();
+        }
+        bail!("ouch list failed: {detail}");
     }
 
     /// Runs `ouch decompress` for a single archive.
@@ -132,6 +154,7 @@ impl OuchClient {
         target: Target,
         password: Option<&str>,
         pid_slot: &AtomicU32,
+        log: &dyn Fn(&str),
     ) -> Result<DecompressOutcome> {
         let workdir = archive
             .parent()
@@ -150,6 +173,7 @@ impl OuchClient {
         }
         cmd.arg(archive);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        log(&describe_command(&cmd));
 
         // Publish the child PID so the progress poller can read `/proc/<pid>/io`
         // while the extraction runs.
@@ -212,6 +236,26 @@ fn read_version(binary: &Path) -> Result<String> {
     Ok(version.to_string())
 }
 
+/// Formats a command for the log, quoting arguments that contain spaces and
+/// masking the password value.
+fn describe_command(cmd: &Command) -> String {
+    let mut out = cmd.get_program().to_string_lossy().into_owned();
+    let mut args = cmd.get_args();
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "-p" {
+            out.push_str(" -p ****");
+            let _ = args.next();
+        } else if arg.contains(|c: char| c.is_whitespace()) {
+            out.push_str(&format!(" \"{arg}\""));
+        } else {
+            out.push(' ');
+            out.push_str(&arg);
+        }
+    }
+    out
+}
+
 /// Picks the stderr text, falling back to stdout when stderr is empty.
 fn stderr_or_stdout(stderr: &[u8], stdout: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
@@ -272,7 +316,7 @@ mod tests {
         build_archive(&ouch, &multi_dir, &["pack/a.txt", "pack/sub"], "multi.zip");
 
         let multi = multi_dir.join("multi.zip");
-        let listing = ouch.list(&multi, None).unwrap();
+        let listing = ouch.list(&multi, None, &|_| {}).unwrap();
         let roots = roots_from_listing(&listing);
         assert!(roots.len() > 1, "expected multiple roots, got {roots:?}");
         assert_eq!(
@@ -281,7 +325,7 @@ mod tests {
         );
 
         let outcome = ouch
-            .decompress(&multi, Target::Folder, None, &AtomicU32::new(0))
+            .decompress(&multi, Target::Folder, None, &AtomicU32::new(0), &|_| {})
             .unwrap();
         assert!(outcome.success, "decompress failed: {}", outcome.stderr);
         assert!(multi_dir.join("multi/a.txt").exists());
@@ -294,7 +338,7 @@ mod tests {
         build_archive(&ouch, &single_dir, &["source"], "single.zip");
 
         let single = single_dir.join("single.zip");
-        let listing = ouch.list(&single, None).unwrap();
+        let listing = ouch.list(&single, None, &|_| {}).unwrap();
         let roots = roots_from_listing(&listing);
         assert_eq!(roots.len(), 1, "expected a single root, got {roots:?}");
         assert_eq!(
@@ -303,7 +347,7 @@ mod tests {
         );
 
         let outcome = ouch
-            .decompress(&single, Target::Here, None, &AtomicU32::new(0))
+            .decompress(&single, Target::Here, None, &AtomicU32::new(0), &|_| {})
             .unwrap();
         assert!(outcome.success, "decompress failed: {}", outcome.stderr);
         assert!(single_dir.join("source/one/file.txt").exists());
