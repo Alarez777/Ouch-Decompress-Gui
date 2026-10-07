@@ -12,6 +12,7 @@ mod i18n;
 mod job;
 mod modes;
 mod ouch;
+mod split;
 mod system;
 mod theme;
 mod update;

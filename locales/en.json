@@ -11,6 +11,7 @@
   "extract.open_folder": "Open folder",
   "extract.working": "Extracting...",
   "extract.all_done": "All archives processed.",
+  "extract.parts": "{count} parts",
   "progress.elapsed": "Elapsed {time}",
   "status.pending": "Pending",
   "status.running": "Running",
