@@ -124,6 +124,9 @@ pub struct App {
     auto_close_on_success: bool,
     /// Set when the window should close at the end of the current frame.
     close_requested: bool,
+    /// Set when the user asked to close while a batch is running, so a
+    /// confirmation modal is shown instead of closing immediately.
+    confirm_close: bool,
     /// Maps a worker batch index to the index in `files`.
     batch_indices: Vec<usize>,
     /// Number of archives whose source could not be deleted after extraction.
@@ -204,6 +207,7 @@ impl App {
             error_popup: None,
             auto_close_on_success,
             close_requested: false,
+            confirm_close: false,
             batch_indices: Vec::new(),
             cleanup_failures: 0,
             results: Vec::new(),
@@ -428,6 +432,7 @@ impl App {
                 self.event_rx = None;
                 self.progress = (0.0, 0);
                 self.batch_started = None;
+                self.confirm_close = false;
                 self.status_line = self.i18n.t("extract.all_done");
 
                 if self.config.notify_on_done {
@@ -574,6 +579,19 @@ impl App {
         self.password_prompt = None;
         self.password_input.clear();
     }
+
+    /// Cancels the batch, terminates the running `ouch` process and closes the
+    /// window. Used when the user confirms closing mid-extraction.
+    fn abort_and_close(&mut self) {
+        self.cancel_batch();
+        if let Some(controller) = &self.controller {
+            let pid = controller
+                .current_pid
+                .load(std::sync::atomic::Ordering::Relaxed);
+            crate::system::terminate_process(pid);
+        }
+        self.close_requested = true;
+    }
 }
 
 impl eframe::App for App {
@@ -605,10 +623,22 @@ impl eframe::App for App {
             }
         }
 
+        // A confirmed close always wins, so it never gets intercepted again.
         if self.close_requested {
             self.flush_config(true);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
+        }
+
+        // If the user closes the window while extracting, cancel the close and
+        // ask for confirmation instead (see `ui_close_confirm`).
+        if ctx.input(|input| input.viewport().close_requested()) {
+            if self.running {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_close = true;
+            } else {
+                self.flush_config(true);
+            }
         }
 
         egui::Panel::top("header").show(ui, |ui| {
@@ -647,6 +677,7 @@ impl eframe::App for App {
         self.ui_password_modal(&ctx);
         self.ui_confirm_disabled(&ctx);
         self.ui_overwrite_modal(&ctx);
+        self.ui_close_confirm(&ctx);
         self.ui_error_modal(&ctx);
         self.draw_drop_overlay(&ctx);
     }
@@ -1457,6 +1488,36 @@ impl App {
         } else if cancel {
             self.confirm_disabled = None;
             self.status_line = self.i18n.t("confirm_disabled.cancelled");
+        }
+    }
+
+    fn ui_close_confirm(&mut self, ctx: &egui::Context) {
+        if !self.confirm_close {
+            return;
+        }
+
+        let mut stay = false;
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("close-confirm-modal")).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.heading(self.i18n.t("close_confirm.title"));
+            ui.label(self.i18n.t("close_confirm.body"));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button(self.i18n.t("close_confirm.close")).clicked() {
+                    close = true;
+                }
+                if ui.button(self.i18n.t("common.cancel")).clicked() {
+                    stay = true;
+                }
+            });
+        });
+
+        if stay {
+            self.confirm_close = false;
+        } else if close {
+            self.confirm_close = false;
+            self.abort_and_close();
         }
     }
 
