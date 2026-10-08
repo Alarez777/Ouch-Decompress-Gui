@@ -662,6 +662,17 @@ impl App {
     }
 
     fn cancel_batch(&mut self) {
+        self.signal_cancel();
+        // Stop the running `ouch` immediately; do it off the UI thread so the
+        // window does not freeze while the child is terminated.
+        let pid = self.current_child_pid();
+        if pid != 0 {
+            std::thread::spawn(move || crate::system::terminate_process(pid));
+        }
+    }
+
+    /// Flags the batch as cancelled and answers any pending password prompt.
+    fn signal_cancel(&mut self) {
         if let Some(controller) = &self.controller {
             controller
                 .cancel_all
@@ -672,14 +683,20 @@ impl App {
         self.password_input.clear();
     }
 
+    fn current_child_pid(&self) -> u32 {
+        self.controller.as_ref().map_or(0, |controller| {
+            controller
+                .current_pid
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
     /// Cancels the batch, terminates the running `ouch` process and closes the
     /// window. Used when the user confirms closing mid-extraction.
     fn abort_and_close(&mut self) {
-        self.cancel_batch();
-        if let Some(controller) = &self.controller {
-            let pid = controller
-                .current_pid
-                .load(std::sync::atomic::Ordering::Relaxed);
+        self.signal_cancel();
+        let pid = self.current_child_pid();
+        if pid != 0 {
             crate::system::terminate_process(pid);
         }
 
