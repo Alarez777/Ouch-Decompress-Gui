@@ -157,6 +157,9 @@ pub struct App {
     /// `(fraction, total_bytes, part_index)`. `total == 0` means unknown, so
     /// the bar is shown as indeterminate.
     progress: (f32, u64, usize),
+    /// True while the current archive is being prepared (split parts joined)
+    /// rather than extracted.
+    joining: bool,
     /// When the current batch started, for the elapsed-time label.
     batch_started: Option<std::time::Instant>,
 }
@@ -231,6 +234,7 @@ impl App {
             results: Vec::new(),
             restart_pending: false,
             progress: (0.0, 0, 0),
+            joining: false,
             batch_started: None,
         };
 
@@ -398,11 +402,19 @@ impl App {
                     self.push_log(format!("-> {}", self.file_name(file_index)));
                 }
                 self.progress = (0.0, 0, 0);
+                self.joining = false;
                 self.status_line = self.i18n.t("extract.working");
             }
             JobEvent::Log { index, line } => {
                 let _ = index;
                 self.push_log(line);
+            }
+            JobEvent::Joining { index, active } => {
+                if let Some(file_index) = self.file_index(index) {
+                    if self.files[file_index].status == Status::Running {
+                        self.joining = active;
+                    }
+                }
             }
             JobEvent::Progress {
                 index,
@@ -489,6 +501,7 @@ impl App {
                 self.controller = None;
                 self.event_rx = None;
                 self.progress = (0.0, 0, 0);
+                self.joining = false;
                 self.batch_started = None;
                 self.confirm_close = false;
                 self.status_line = self.i18n.t("extract.all_done");
@@ -847,6 +860,13 @@ impl App {
                         .t("extract.parts")
                         .replace("{count}", &parts.to_string());
                     ui.label(egui::RichText::new(hint).small().color(egui::Color32::GRAY));
+                }
+                if self.joining {
+                    ui.label(
+                        egui::RichText::new(self.i18n.t("extract.joining"))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(self.i18n.t("common.cancel")).clicked() {

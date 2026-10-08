@@ -44,6 +44,13 @@ pub enum JobEvent {
         index: usize,
         conflicts: Vec<PathBuf>,
     },
+    /// The worker is preparing an archive before extracting it (joining the
+    /// parts of a split) or has finished preparing. The UI shows this phase
+    /// instead of "extracting".
+    Joining {
+        index: usize,
+        active: bool,
+    },
     /// Approximate progress of the archive currently being extracted.
     /// `fraction` is `0.0..=1.0`, computed from the bytes `ouch` has read from
     /// the archive versus its total size. For a multi-volume set `part_index`
@@ -214,29 +221,47 @@ fn process_one(
     // concatenates the volumes into a temporary (see `multivolume`); other
     // archives are returned untouched. `workdir` keeps the output next to the
     // original even when the temporary lives elsewhere (e.g. /dev/shm).
-    let prepared = match multivolume::prepare(
-        archive,
-        &cleanup_parts,
-        split::kind(archive),
-        |copied, total| {
-            let fraction = if total == 0 {
-                0.0
-            } else {
-                copied as f32 / total as f32
-            };
-            let _ = send(
-                event_tx,
-                ctx,
-                JobEvent::Progress {
-                    index,
-                    fraction,
-                    total,
-                    part_index: 0,
-                },
-            );
-            ctx.request_repaint();
-        },
-    ) {
+    let split_kind = split::kind(archive);
+    let joining = split_kind == split::SplitKind::Concat;
+    if joining {
+        let _ = send(
+            event_tx,
+            ctx,
+            JobEvent::Joining {
+                index,
+                active: true,
+            },
+        );
+    }
+    let prepared = multivolume::prepare(archive, &cleanup_parts, split_kind, |copied, total| {
+        let fraction = if total == 0 {
+            0.0
+        } else {
+            copied as f32 / total as f32
+        };
+        let _ = send(
+            event_tx,
+            ctx,
+            JobEvent::Progress {
+                index,
+                fraction,
+                total,
+                part_index: 0,
+            },
+        );
+        ctx.request_repaint();
+    });
+    if joining {
+        let _ = send(
+            event_tx,
+            ctx,
+            JobEvent::Joining {
+                index,
+                active: false,
+            },
+        );
+    }
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(err) => return fail(index, err.to_string()),
     };
