@@ -93,11 +93,12 @@ impl OuchClient {
         &self.version
     }
 
-    /// Runs `ouch list -A -q` and returns the raw listing.
+    /// Runs `ouch list` and returns the raw listing.
     ///
-    /// `-A` disables colors and `-q` suppresses the `Archive:` header, which
-    /// makes the output easy to parse. Fails for non-archive formats and for
-    /// encrypted archives when the password is wrong or missing.
+    /// Prefers `-A -q` (no colors, no `Archive:` header) but falls back to the
+    /// plain listing when that fails or crashes, which happens with some
+    /// archives. Fails for non-archive formats and for encrypted archives when
+    /// the password is wrong or missing. Each command is passed to `log`.
     pub fn list(
         &self,
         archive: &Path,
