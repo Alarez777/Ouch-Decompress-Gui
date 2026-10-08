@@ -1489,7 +1489,6 @@ impl App {
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.new_password_input)
-                    .password(true)
                     .hint_text(self.i18n.t("settings.password_placeholder"))
                     .desired_width(240.0),
             );
