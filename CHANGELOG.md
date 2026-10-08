@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-07
+
+### Added
+
+- Support for multi-volume RAR sets (`name.part1.rar`, ...): the whole set is
+  queued as one job, all parts are removed after extraction, and the running
+  entry shows the volume being read (`k/N`).
+- Notification policy: Always, Only on failures (default) or Never.
+- The Log window now shows every `ouch` command that runs (passwords masked).
+
+### Changed
+
+- The password field is focused automatically when its prompt appears.
+- When `ouch list` fails — it can crash on some archives — the plain listing is
+  retried, and if that fails too the password is requested before giving up, so
+  Smart mode keeps working.
+- Finish notifications omit the failure count when there are no failures, and
+  stay quiet when nothing was processed.
+- Spanish: the Log button and window now read "Log".
+
 ## [0.2.2] - 2026-10-07
 
 ### Changed
