@@ -131,6 +131,30 @@ impl Notifications {
     }
 }
 
+/// How the saved passwords are listed in the settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PasswordSort {
+    /// Alphabetical order.
+    #[default]
+    Alphabetical,
+    /// The order they were added in.
+    Added,
+}
+
+impl PasswordSort {
+    /// All variants in presentation order.
+    pub const ALL: [PasswordSort; 2] = [PasswordSort::Alphabetical, PasswordSort::Added];
+
+    /// Translation key for the label.
+    pub fn label_key(&self) -> &'static str {
+        match self {
+            PasswordSort::Alphabetical => "password_sort.alphabetical",
+            PasswordSort::Added => "password_sort.added",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -141,6 +165,8 @@ pub struct Config {
     /// Passwords tried automatically, in order. Stored in plain text on
     /// purpose; the UI warns the user about this.
     pub passwords: Vec<String>,
+    /// How the saved passwords are listed in the settings.
+    pub password_sort: PasswordSort,
     /// Format ids (see `formats::FORMATS`) the user does NOT want to
     /// auto-extract without confirmation.
     pub disabled_formats: Vec<String>,
@@ -199,6 +225,7 @@ impl Default for Config {
             version: 1,
             decompress_mode: DecompressMode::Smart,
             passwords: Vec::new(),
+            password_sort: PasswordSort::Alphabetical,
             disabled_formats: Vec::new(),
             language: Language::System,
             theme: ThemeChoice::System,

@@ -6,7 +6,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
 
-use crate::config::{AfterExtract, Config, ConflictPolicy, Notifications, TrashFallback};
+use crate::config::{
+    AfterExtract, Config, ConflictPolicy, Notifications, PasswordSort, TrashFallback,
+};
 use crate::formats;
 use crate::i18n::I18n;
 use crate::job::{self, JobAnswer, JobController, JobEvent};
@@ -1480,8 +1482,43 @@ impl App {
         );
         ui.add_space(6.0);
 
+        if !self.config.passwords.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(self.i18n.t("settings.password_sort"));
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("password-sort-combo")
+                    .selected_text(self.i18n.t(self.config.password_sort.label_key()))
+                    .show_ui(ui, |ui| {
+                        for option in PasswordSort::ALL {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.config.password_sort,
+                                    option,
+                                    self.i18n.t(option.label_key()),
+                                )
+                                .changed();
+                        }
+                    });
+                if changed {
+                    self.persist();
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        // Display order only; the stored order (insertion) is what is tried.
+        let mut order: Vec<usize> = (0..self.config.passwords.len()).collect();
+        if self.config.password_sort == PasswordSort::Alphabetical {
+            order.sort_by(|a, b| {
+                self.config.passwords[*a]
+                    .to_lowercase()
+                    .cmp(&self.config.passwords[*b].to_lowercase())
+            });
+        }
+
         let mut remove: Option<usize> = None;
-        for (index, password) in self.config.passwords.iter().enumerate() {
+        for &index in &order {
+            let password = &self.config.passwords[index];
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(password).monospace());
                 if ui.small_button("x").clicked() {
