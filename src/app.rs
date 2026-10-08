@@ -6,7 +6,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
 
-use crate::config::{AfterExtract, Config, ConflictPolicy, Notifications, TrashFallback};
+use crate::config::{
+    AfterExtract, Config, ConflictPolicy, Notifications, PasswordSort, TrashFallback,
+};
 use crate::formats;
 use crate::i18n::I18n;
 use crate::job::{self, JobAnswer, JobController, JobEvent};
@@ -121,6 +123,10 @@ pub struct App {
     overwrite_prompt: Option<OverwritePrompt>,
     password_input: String,
     new_password_input: String,
+    /// Text of the "add multiple passwords" dialog, one per line.
+    bulk_password_input: String,
+    /// Whether the "add multiple passwords" dialog is open.
+    bulk_password_open: bool,
     /// Set when a new password prompt appears, so its field gets focus once.
     password_focus: bool,
     applied_theme: Option<ThemeChoice>,
@@ -210,6 +216,8 @@ impl App {
             overwrite_prompt: None,
             password_input: String::new(),
             new_password_input: String::new(),
+            bulk_password_input: String::new(),
+            bulk_password_open: false,
             password_focus: false,
             applied_theme: None,
             confirm_disabled: None,
@@ -1184,11 +1192,13 @@ impl App {
             |ui, _class| {
                 if ui.ctx().input(|input| input.viewport().close_requested()) {
                     self.open_settings = false;
+                    self.bulk_password_open = false;
                     self.flush_config(true);
                     ui.ctx().request_repaint();
                     return;
                 }
                 egui::CentralPanel::default().show(ui, |ui| self.ui_settings(ui));
+                self.ui_bulk_password_modal(ui.ctx());
             },
         );
     }
@@ -1472,15 +1482,87 @@ impl App {
         );
         ui.add_space(6.0);
 
-        let mut remove: Option<usize> = None;
-        for (index, password) in self.config.passwords.iter().enumerate() {
+        if !self.config.passwords.is_empty() {
             ui.horizontal(|ui| {
-                let masked = "*".repeat(password.chars().count().max(1));
-                ui.label(egui::RichText::new(masked).monospace());
-                if ui.small_button("x").clicked() {
-                    remove = Some(index);
+                ui.label(self.i18n.t("settings.password_sort"));
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("password-sort-combo")
+                    .selected_text(self.i18n.t(self.config.password_sort.label_key()))
+                    .show_ui(ui, |ui| {
+                        for option in PasswordSort::ALL {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.config.password_sort,
+                                    option,
+                                    self.i18n.t(option.label_key()),
+                                )
+                                .changed();
+                        }
+                    });
+                if changed {
+                    self.persist();
                 }
             });
+            ui.add_space(4.0);
+        }
+
+        // Display order only; the stored order (insertion) is what is tried.
+        let mut order: Vec<usize> = (0..self.config.passwords.len()).collect();
+        if self.config.password_sort == PasswordSort::Alphabetical {
+            order.sort_by(|a, b| {
+                self.config.passwords[*a]
+                    .to_lowercase()
+                    .cmp(&self.config.passwords[*b].to_lowercase())
+            });
+        }
+
+        let mut remove: Option<usize> = None;
+        if !order.is_empty() {
+            // Defined block colors (black/white in dark, light/near-black in
+            // light), so the stored passwords stand out from plain labels.
+            let (fill, border, text) = if ui.visuals().dark_mode {
+                (
+                    egui::Color32::from_gray(0),
+                    egui::Color32::from_gray(70),
+                    egui::Color32::from_gray(255),
+                )
+            } else {
+                (
+                    egui::Color32::from_gray(240),
+                    egui::Color32::from_gray(200),
+                    egui::Color32::from_gray(20),
+                )
+            };
+            egui::Frame::group(ui.style())
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, border))
+                .inner_margin(egui::Margin::same(8))
+                .corner_radius(6.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("passwords-scroll")
+                        .max_height(220.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for &index in &order {
+                                let password = &self.config.passwords[index];
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(password).monospace().color(text));
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            // Keep the button clear of the scrollbar.
+                                            ui.add_space(8.0);
+                                            if ui.small_button("x").clicked() {
+                                                remove = Some(index);
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                });
         }
         if let Some(index) = remove {
             self.config.passwords.remove(index);
@@ -1490,7 +1572,6 @@ impl App {
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.new_password_input)
-                    .password(true)
                     .hint_text(self.i18n.t("settings.password_placeholder"))
                     .desired_width(240.0),
             );
@@ -1504,6 +1585,60 @@ impl App {
                 }
             }
         });
+
+        ui.add_space(6.0);
+        if ui.button(self.i18n.t("settings.add_multiple")).clicked() {
+            self.bulk_password_input.clear();
+            self.bulk_password_open = true;
+        }
+    }
+
+    fn ui_bulk_password_modal(&mut self, ctx: &egui::Context) {
+        if !self.bulk_password_open {
+            return;
+        }
+
+        let mut save = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("bulk-password-modal")).show(ctx, |ui| {
+            let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
+            ui.set_min_width(max_width.min(400.0));
+            ui.set_max_width(max_width);
+            ui.heading(self.i18n.t("settings.bulk_passwords.title"));
+            ui.label(
+                egui::RichText::new(self.i18n.t("settings.bulk_passwords.hint"))
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut self.bulk_password_input)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(self.i18n.t("settings.bulk_passwords.save"))
+                    .clicked()
+                {
+                    save = true;
+                }
+                if ui.button(self.i18n.t("common.cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if save {
+            self.config
+                .add_passwords_from_text(&self.bulk_password_input);
+            self.bulk_password_input.clear();
+            self.bulk_password_open = false;
+            self.persist();
+        } else if cancel {
+            self.bulk_password_input.clear();
+            self.bulk_password_open = false;
+        }
     }
 
     fn ui_password_modal(&mut self, ctx: &egui::Context) {
