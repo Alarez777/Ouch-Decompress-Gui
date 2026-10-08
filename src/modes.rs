@@ -155,6 +155,16 @@ mod tests {
     }
 
     #[test]
+    fn smart_single_file_root_extracts_here() {
+        let roots = roots_from_listing("Def Jam Fight for NY ESP.iso\n");
+        assert_eq!(roots, vec!["Def Jam Fight for NY ESP.iso".to_string()]);
+        assert_eq!(
+            choose_target(DecompressMode::Smart, true, &roots),
+            Target::Here
+        );
+    }
+
+    #[test]
     fn smart_mode_picks_target() {
         assert_eq!(
             choose_target(DecompressMode::Smart, true, &["only".into()]),

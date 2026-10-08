@@ -187,6 +187,9 @@ fn process_one(
     // Every file of a multi-volume set, for the post-extraction cleanup.
     let cleanup_parts = split::archive_parts(archive);
 
+    // Logs each `ouch` command as it runs.
+    let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
+
     // Progress reporting is based on the bytes `ouch` reads from the archive,
     // so it works even for a single huge file (where counting entries does
     // not). The guard stops the poller when this function returns. `current_pid`
@@ -220,7 +223,7 @@ fn process_one(
             return fail(index, message);
         }
         let result = result_name(archive, false, None);
-        return match ouch.decompress(archive, Target::Here, None, current_pid) {
+        return match ouch.decompress(archive, Target::Here, None, current_pid, &log) {
             Ok(outcome) if outcome.success => finish_success(
                 index,
                 archive,
@@ -262,6 +265,12 @@ fn process_one(
             if config.decompress_mode == DecompressMode::Smart {
                 let roots = modes::roots_from_listing(&text);
                 target = modes::choose_target(DecompressMode::Smart, true, &roots);
+                log_line(
+                    event_tx,
+                    ctx,
+                    index,
+                    format!("smart: {} root(s) -> {}", roots.len(), target.label()),
+                );
             }
             listing = Some(text);
         }
@@ -323,7 +332,7 @@ fn process_one(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
-        match ouch.decompress(archive, target, candidate.as_deref(), current_pid) {
+        match ouch.decompress(archive, target, candidate.as_deref(), current_pid, &log) {
             Ok(outcome) if outcome.success => {
                 if candidate.is_some() {
                     *batch_password = candidate;
@@ -369,7 +378,7 @@ fn process_one(
         first_prompt = false;
         match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
             JobAnswer::Password(password) => {
-                match ouch.decompress(archive, target, Some(&password), current_pid) {
+                match ouch.decompress(archive, target, Some(&password), current_pid, &log) {
                     Ok(outcome) if outcome.success => {
                         *batch_password = Some(password);
                         return finish_success(
@@ -709,6 +718,12 @@ fn is_password_error(message: &str) -> bool {
     message.contains("password") || message.contains("encrypt") || message.contains("decrypt")
 }
 
+/// Heuristic: a crash (or an unexplained non-zero exit) may be an encrypted
+/// archive that `ouch` cannot describe without the password.
+fn looks_like_crash(message: &str) -> bool {
+    message.contains("signal:") || message.contains("exit status")
+}
+
 /// Parses the `rchar` field (bytes read via syscalls) from `/proc/<pid>/io`.
 fn parse_rchar(contents: &str) -> Option<u64> {
     contents
@@ -831,10 +846,11 @@ enum SkipReason {
 }
 
 /// Tries to list an archive using, in order: no password, the batch password,
-/// then every saved password. If a password is required, asks the user until a
-/// password works or the user skips/cancels. Non-password failures are
-/// returned as [`SkipReason::HardError`] so the caller never asks for a
-/// password the archive does not have.
+/// then every saved password. If a password is required — or `ouch` crashes,
+/// which may hide an encrypted archive — it asks the user until a password
+/// works or the user skips/cancels. Other failures are returned as
+/// [`SkipReason::HardError`] so the caller never asks for a password the
+/// archive does not have.
 #[allow(clippy::too_many_arguments)]
 fn obtain_listing(
     ouch: &OuchClient,
@@ -846,6 +862,7 @@ fn obtain_listing(
     index: usize,
     ctx: &egui::Context,
 ) -> Result<(String, Option<String>), SkipReason> {
+    let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
     let mut candidates: Vec<Option<String>> = vec![None];
     if let Some(batch) = batch_password.clone() {
         candidates.push(Some(batch));
@@ -862,7 +879,7 @@ fn obtain_listing(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
-        match ouch.list(archive, candidate.as_deref()) {
+        match ouch.list(archive, candidate.as_deref(), &log) {
             Ok(listing) => {
                 if candidate.is_some() {
                     *batch_password = candidate.clone();
@@ -878,7 +895,9 @@ fn obtain_listing(
         }
     }
 
-    if !password_related {
+    // A crash may hide an encrypted archive that `ouch list` cannot describe
+    // without the password, so it is worth offering the password prompt.
+    if !password_related && !looks_like_crash(&last_error) {
         return Err(SkipReason::HardError(last_error));
     }
 
@@ -897,7 +916,7 @@ fn obtain_listing(
 
         let answer = answer_rx.recv().unwrap_or(JobAnswer::CancelBatch);
         match answer {
-            JobAnswer::Password(password) => match ouch.list(archive, Some(&password)) {
+            JobAnswer::Password(password) => match ouch.list(archive, Some(&password), &log) {
                 Ok(listing) => {
                     *batch_password = Some(password);
                     return Ok((listing, batch_password.clone()));
@@ -947,6 +966,13 @@ mod tests {
         ));
         assert!(!is_password_error("No such file or directory (os error 2)"));
         assert!(!is_password_error("It is not a valid archive"));
+    }
+
+    #[test]
+    fn treats_crashes_as_ambiguous() {
+        assert!(looks_like_crash("ouch list failed: signal: 11 (SIGSEGV)"));
+        assert!(looks_like_crash("ouch list failed: exit status: 1"));
+        assert!(!looks_like_crash("ouch list failed: not a valid archive"));
     }
 
     #[test]
@@ -1148,6 +1174,107 @@ mod tests {
         config: &Config,
     ) -> (JobEvent, Vec<JobEvent>) {
         run_process_one_with(ouch, archive, config, &[JobAnswer::Skip, JobAnswer::Skip])
+    }
+
+    /// Builds a (possibly multi-volume) RAR with the `rar` tool and returns its
+    /// first part, or `None` when `rar` is not available.
+    fn build_multipart_rar(
+        dir: &Path,
+        inputs: &[&str],
+        base: &str,
+        volume: &str,
+    ) -> Option<PathBuf> {
+        let status = Command::new("rar")
+            .current_dir(dir)
+            .args(["a", "-idq", "-v", volume, "-m0", base])
+            .args(inputs)
+            .stdin(Stdio::null())
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        let stem = base.strip_suffix(".rar")?;
+        let first = dir.join(format!("{stem}.part1.rar"));
+        Some(if first.exists() {
+            first
+        } else {
+            dir.join(base)
+        })
+    }
+
+    #[test]
+    fn smart_single_root_multipart_extracts_here() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        let base = unique_dir("smart-multi-here");
+        std::fs::write(base.join("Payload.iso"), vec![7u8; 200_000]).unwrap();
+        let Some(archive) = build_multipart_rar(&base, &["Payload.iso"], "multi.rar", "100k")
+        else {
+            eprintln!("skipping: rar tool not found");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        std::fs::remove_file(base.join("Payload.iso")).unwrap();
+
+        let config = Config {
+            decompress_mode: DecompressMode::Smart,
+            conflict_policy: ConflictPolicy::Overwrite,
+            after_extract: AfterExtract::Keep,
+            ..Config::default()
+        };
+        let (event, _) = run_process_one(&ouch, &archive, &config);
+
+        assert!(
+            matches!(event, JobEvent::Done { success: true, .. }),
+            "event: {event:?}"
+        );
+        assert!(base.join("Payload.iso").exists(), "should extract here");
+        assert!(
+            !base.join("multi.part1").exists(),
+            "a single root must not create a wrapper folder"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn smart_multiple_roots_multipart_makes_a_folder() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        let base = unique_dir("smart-multi-folder");
+        std::fs::write(base.join("one.txt"), vec![1u8; 80_000]).unwrap();
+        std::fs::write(base.join("two.txt"), vec![2u8; 80_000]).unwrap();
+        let Some(archive) =
+            build_multipart_rar(&base, &["one.txt", "two.txt"], "multi.rar", "100k")
+        else {
+            eprintln!("skipping: rar tool not found");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        std::fs::remove_file(base.join("one.txt")).unwrap();
+        std::fs::remove_file(base.join("two.txt")).unwrap();
+
+        let config = Config {
+            decompress_mode: DecompressMode::Smart,
+            conflict_policy: ConflictPolicy::Overwrite,
+            after_extract: AfterExtract::Keep,
+            ..Config::default()
+        };
+        let (event, _) = run_process_one(&ouch, &archive, &config);
+
+        assert!(
+            matches!(event, JobEvent::Done { success: true, .. }),
+            "event: {event:?}"
+        );
+        assert!(
+            base.join("multi.part1").join("one.txt").exists(),
+            "multiple roots should create a folder"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
