@@ -738,7 +738,11 @@ fn looks_like_crash(message: &str) -> bool {
 
 /// Builds the localized message for a multi-volume set with missing volumes.
 fn missing_parts_message(i18n: &I18n, missing: &split::MissingParts) -> String {
-    let names = missing.names.join(", ");
+    let mut names = missing.names.join(", ");
+    if missing.more {
+        names.push_str(", ");
+        names.push_str(&i18n.t("error.missing_more"));
+    }
     match missing.total {
         Some(total) => i18n
             .t("error.missing_parts_of")
@@ -1336,6 +1340,48 @@ mod tests {
             } => {
                 assert!(!success, "should fail");
                 assert!(message.contains("multi.part1.rar"), "message: {message}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(!base.join("Payload.iso").exists(), "must not extract");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_last_volumes_fails_clearly() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        let base = unique_dir("missing-last");
+        std::fs::write(base.join("Payload.iso"), vec![4u8; 250_000]).unwrap();
+        let Some(_first) = build_multipart_rar(&base, &["Payload.iso"], "multi.rar", "100k") else {
+            eprintln!("skipping: rar tool not found");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        std::fs::remove_file(base.join("Payload.iso")).unwrap();
+        // Keep only the first volume; the rest are the missing trailing parts.
+        for number in 2..=12 {
+            let _ = std::fs::remove_file(base.join(format!("multi.part{number}.rar")));
+        }
+        let first = base.join("multi.part1.rar");
+        assert!(first.exists());
+
+        let config = Config {
+            decompress_mode: DecompressMode::Smart,
+            conflict_policy: ConflictPolicy::Overwrite,
+            after_extract: AfterExtract::Keep,
+            ..Config::default()
+        };
+        let (event, _) = run_process_one(&ouch, &first, &config);
+
+        match event {
+            JobEvent::Done {
+                success, message, ..
+            } => {
+                assert!(!success, "should fail");
+                assert!(message.contains("multi.part2.rar"), "message: {message}");
             }
             other => panic!("unexpected event: {other:?}"),
         }
