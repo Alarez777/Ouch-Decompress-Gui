@@ -167,6 +167,7 @@ fn run(
             &event_tx,
             index,
             &current_pid,
+            &cancel_all,
             &ctx,
         );
         send(&event_tx, &ctx, event);
@@ -186,6 +187,7 @@ fn process_one(
     event_tx: &Sender<JobEvent>,
     index: usize,
     current_pid: &Arc<AtomicU32>,
+    cancel_all: &Arc<AtomicBool>,
     ctx: &egui::Context,
 ) -> JobEvent {
     if !archive.exists() {
@@ -233,24 +235,30 @@ fn process_one(
             },
         );
     }
-    let prepared = multivolume::prepare(archive, &cleanup_parts, split_kind, |copied, total| {
-        let fraction = if total == 0 {
-            0.0
-        } else {
-            copied as f32 / total as f32
-        };
-        let _ = send(
-            event_tx,
-            ctx,
-            JobEvent::Progress {
-                index,
-                fraction,
-                total,
-                part_index: 0,
-            },
-        );
-        ctx.request_repaint();
-    });
+    let prepared = multivolume::prepare(
+        archive,
+        &cleanup_parts,
+        split_kind,
+        cancel_all,
+        |copied, total| {
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                copied as f32 / total as f32
+            };
+            let _ = send(
+                event_tx,
+                ctx,
+                JobEvent::Progress {
+                    index,
+                    fraction,
+                    total,
+                    part_index: 0,
+                },
+            );
+            ctx.request_repaint();
+        },
+    );
     if joining {
         let _ = send(
             event_tx,
@@ -262,7 +270,8 @@ fn process_one(
         );
     }
     let prepared = match prepared {
-        Ok(prepared) => prepared,
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return fail(index, "cancelled".into()),
         Err(err) => return fail(index, err.to_string()),
     };
     let source = prepared.path();
@@ -329,6 +338,7 @@ fn process_one(
         answer_rx,
         event_tx,
         index,
+        cancel_all,
         ctx,
     ) {
         Ok((text, found)) => {
@@ -403,6 +413,9 @@ fn process_one(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
+        if cancel_all.load(Ordering::Relaxed) {
+            return fail(index, "cancelled".into());
+        }
         match ouch.decompress(
             source,
             &workdir,
@@ -435,6 +448,9 @@ fn process_one(
                 password_related |= is_password_error(&last_error);
             }
         }
+        if cancel_all.load(Ordering::Relaxed) {
+            return fail(index, "cancelled".into());
+        }
     }
 
     if !password_related {
@@ -444,6 +460,9 @@ fn process_one(
     // Ask the user, retrying until a password works or the user skips/cancels.
     let mut first_prompt = true;
     loop {
+        if cancel_all.load(Ordering::Relaxed) {
+            return fail(index, "cancelled".into());
+        }
         let _ = send(
             event_tx,
             ctx,
@@ -956,6 +975,7 @@ fn obtain_listing(
     answer_rx: &Receiver<JobAnswer>,
     event_tx: &Sender<JobEvent>,
     index: usize,
+    cancel_all: &Arc<AtomicBool>,
     ctx: &egui::Context,
 ) -> Result<(String, Option<String>), SkipReason> {
     let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
@@ -975,6 +995,9 @@ fn obtain_listing(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
+        if cancel_all.load(Ordering::Relaxed) {
+            return Err(SkipReason::BatchCancelled);
+        }
         match ouch.list(archive, candidate.as_deref(), &log) {
             Ok(listing) => {
                 if candidate.is_some() {
@@ -999,6 +1022,9 @@ fn obtain_listing(
 
     let mut first_prompt = true;
     loop {
+        if cancel_all.load(Ordering::Relaxed) {
+            return Err(SkipReason::BatchCancelled);
+        }
         let _ = send(
             event_tx,
             ctx,
@@ -1248,6 +1274,7 @@ mod tests {
         }
 
         let current_pid = Arc::new(AtomicU32::new(0));
+        let cancel_all = Arc::new(AtomicBool::new(false));
         let i18n = I18n::new(crate::i18n::Language::En);
         let event = process_one(
             ouch,
@@ -1259,6 +1286,7 @@ mod tests {
             &event_tx,
             0,
             &current_pid,
+            &cancel_all,
             &ctx,
         );
         let events: Vec<JobEvent> = event_rx.try_iter().collect();

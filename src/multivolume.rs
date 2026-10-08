@@ -12,6 +12,7 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -49,33 +50,40 @@ impl Drop for TempDir {
 /// For anything but a raw numeric split this is `archive` itself. For a split
 /// the volumes are concatenated into a temporary file (in RAM when it fits and
 /// there is enough free memory, next to the archive otherwise). `progress` is
-/// called with `(copied_bytes, total_bytes)` while copying.
+/// called with `(copied_bytes, total_bytes)` while copying, and `Ok(None)` is
+/// returned when `cancel` is set mid-copy.
 pub fn prepare(
     archive: &Path,
     parts: &[PathBuf],
     kind: SplitKind,
+    cancel: &AtomicBool,
     progress: impl FnMut(u64, u64),
-) -> Result<Prepared> {
+) -> Result<Option<Prepared>> {
     if kind != SplitKind::Concat || parts.is_empty() {
-        return Ok(Prepared {
+        return Ok(Some(Prepared {
             path: archive.to_path_buf(),
             _temp: None,
-        });
+        }));
     }
 
     let total: u64 = parts.iter().map(|part| file_size(part)).sum();
     let temp_dir = choose_temp_dir(archive, total);
     std::fs::create_dir_all(&temp_dir)
         .with_context(|| format!("creating {}", temp_dir.display()))?;
+    // The guard removes the temporary if we return early (cancelled).
+    let temp = TempDir(temp_dir.clone());
     let temp_path = temp_dir.join(base_name(archive));
 
-    copy_parts(parts, &temp_path, total, progress)
+    let done = copy_parts(parts, &temp_path, total, cancel, progress)
         .with_context(|| format!("concatenating {} parts", parts.len()))?;
+    if !done {
+        return Ok(None);
+    }
 
-    Ok(Prepared {
+    Ok(Some(Prepared {
         path: temp_path,
-        _temp: Some(TempDir(temp_dir)),
-    })
+        _temp: Some(temp),
+    }))
 }
 
 /// The base name of the split without its volume number (`def.7z.001` ->
@@ -114,13 +122,15 @@ fn choose_temp_dir(archive: &Path, total: u64) -> PathBuf {
     parent.join(format!(".{name}"))
 }
 
-/// Copies every part, in order, into `dest`, reporting progress.
+/// Copies every part, in order, into `dest`, reporting progress. Returns
+/// `false` when `cancel` was requested (the caller removes the temporary).
 fn copy_parts(
     parts: &[PathBuf],
     dest: &Path,
     total: u64,
+    cancel: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
-) -> Result<()> {
+) -> Result<bool> {
     const BUFFER: usize = 1 << 20;
 
     let file = File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -132,6 +142,9 @@ fn copy_parts(
         let file = File::open(part).with_context(|| format!("opening {}", part.display()))?;
         let mut reader = BufReader::with_capacity(BUFFER, file);
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
             let read = reader
                 .read(&mut buffer)
                 .with_context(|| format!("reading {}", part.display()))?;
@@ -149,7 +162,7 @@ fn copy_parts(
     writer
         .flush()
         .with_context(|| format!("flushing {}", dest.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 /// Size of a file, or 0 when it cannot be read.
@@ -217,8 +230,10 @@ mod tests {
             archive,
             &[archive.to_path_buf()],
             SplitKind::None,
+            &AtomicBool::new(false),
             |_, _| {},
         )
+        .unwrap()
         .unwrap();
         assert_eq!(prepared.path(), archive);
     }
@@ -241,14 +256,42 @@ mod tests {
             &first,
             &[first.clone(), second.clone()],
             SplitKind::Concat,
+            &AtomicBool::new(false),
             |c, t| {
                 last = (c, t);
             },
         )
+        .unwrap()
         .unwrap();
 
         assert_eq!(std::fs::read(prepared.path()).unwrap(), b"hello world");
         assert_eq!(last, (11, 11));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_before_copying_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "ouch-multivolume-cancel-{}-{}",
+            std::process::id(),
+            unique_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("a.001");
+        let second = dir.join("a.002");
+        std::fs::write(&first, b"hello ").unwrap();
+        std::fs::write(&second, b"world").unwrap();
+
+        let prepared = prepare(
+            &first,
+            &[first.clone(), second.clone()],
+            SplitKind::Concat,
+            &AtomicBool::new(true),
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert!(prepared.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
