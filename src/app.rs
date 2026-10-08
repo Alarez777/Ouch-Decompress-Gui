@@ -1517,14 +1517,50 @@ impl App {
         }
 
         let mut remove: Option<usize> = None;
-        for &index in &order {
-            let password = &self.config.passwords[index];
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(password).monospace());
-                if ui.small_button("x").clicked() {
-                    remove = Some(index);
-                }
-            });
+        if !order.is_empty() {
+            // Defined block colors (black/white in dark, light/near-black in
+            // light), so the stored passwords stand out from plain labels.
+            let (fill, border, text) = if ui.visuals().dark_mode {
+                (
+                    egui::Color32::from_gray(0),
+                    egui::Color32::from_gray(70),
+                    egui::Color32::from_gray(255),
+                )
+            } else {
+                (
+                    egui::Color32::from_gray(240),
+                    egui::Color32::from_gray(200),
+                    egui::Color32::from_gray(20),
+                )
+            };
+            egui::Frame::group(ui.style())
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, border))
+                .inner_margin(egui::Margin::same(8))
+                .corner_radius(6.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("passwords-scroll")
+                        .max_height(220.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for &index in &order {
+                                let password = &self.config.passwords[index];
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(password).monospace().color(text));
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("x").clicked() {
+                                                remove = Some(index);
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                });
         }
         if let Some(index) = remove {
             self.config.passwords.remove(index);
