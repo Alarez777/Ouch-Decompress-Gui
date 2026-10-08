@@ -95,6 +95,7 @@
   "ouch.not_found_hint": "Install ouch or use the bundled AppImage.",
   "error.missing_parts": "Incomplete archive — missing: {names}",
   "error.missing_parts_of": "Incomplete archive — missing: {names} (of {total})",
+  "error.missing_parts_at_least": "Incomplete archive — missing at least: {names}",
   "about.title": "About",
   "about.version": "Version",
   "about.checking": "Checking for updates...",
