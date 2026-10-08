@@ -1475,8 +1475,7 @@ impl App {
         let mut remove: Option<usize> = None;
         for (index, password) in self.config.passwords.iter().enumerate() {
             ui.horizontal(|ui| {
-                let masked = "*".repeat(password.chars().count().max(1));
-                ui.label(egui::RichText::new(masked).monospace());
+                ui.label(egui::RichText::new(password).monospace());
                 if ui.small_button("x").clicked() {
                     remove = Some(index);
                 }
