@@ -738,10 +738,11 @@ fn looks_like_crash(message: &str) -> bool {
 
 /// Builds the localized message for a multi-volume set with missing volumes.
 fn missing_parts_message(i18n: &I18n, missing: &split::MissingParts) -> String {
-    let mut names = missing.names.join(", ");
+    let names = missing.names.join(", ");
     if missing.more {
-        names.push_str(", ");
-        names.push_str(&i18n.t("error.missing_more"));
+        return i18n
+            .t("error.missing_parts_at_least")
+            .replace("{names}", &names);
     }
     match missing.total {
         Some(total) => i18n
