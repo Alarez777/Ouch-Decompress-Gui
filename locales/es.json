@@ -93,6 +93,8 @@
   "log.empty": "El registro está vacío.",
   "ouch.not_found": "No se encontró el binario ouch.",
   "ouch.not_found_hint": "Instala ouch o usa el AppImage incluido.",
+  "error.missing_parts": "Archivo incompleto — faltan: {names}",
+  "error.missing_parts_of": "Archivo incompleto — faltan: {names} (de {total})",
   "about.title": "Acerca de",
   "about.version": "Versión",
   "about.checking": "Buscando actualizaciones...",

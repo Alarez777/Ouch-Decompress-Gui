@@ -298,7 +298,7 @@ impl App {
             .map(|&index| self.files[index].path.clone())
             .collect();
         let config = self.config.clone();
-        let (controller, rx) = job::spawn(ouch, archives, config, ctx.clone());
+        let (controller, rx) = job::spawn(ouch, archives, config, self.i18n.clone(), ctx.clone());
         self.controller = Some(controller);
         self.event_rx = Some(rx);
         self.batch_indices = pending;

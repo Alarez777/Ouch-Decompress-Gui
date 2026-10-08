@@ -61,6 +61,7 @@ const ES_JSON: &str = include_str!("../locales/es.json");
 
 /// Resolved translator instance. Both maps are parsed once, up front, so
 /// lookups never touch the JSON again.
+#[derive(Clone)]
 pub struct I18n {
     map: HashMap<String, String>,
     fallback: HashMap<String, String>,
