@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-08
+
+### Fixed
+
+- The Cancel button now stops the running extraction immediately by
+  terminating the `ouch` process, and also interrupts the concatenation of
+  split volumes and the password prompts.
+
 ## [0.2.4] - 2026-10-08
 
 ### Added
