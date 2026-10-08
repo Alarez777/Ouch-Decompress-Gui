@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-08
+
+### Added
+
+- Incomplete multi-volume RAR sets are detected — missing first, middle or last
+  volumes — and reported with the missing file names before extracting anything.
+- The Passwords tab shows saved passwords in plain text and can add several at
+  once (one per line; empty and duplicate entries are skipped).
+- Saved passwords can be listed alphabetically (default) or in insertion order.
+
+### Changed
+
+- Saved passwords are shown in a framed, scrollable block so they stand out.
+- Dialogs no longer grow wider than the window.
+- Removed the RAR licensing note from the README, since the app only extracts.
+
 ## [0.2.3] - 2026-10-07
 
 ### Added
