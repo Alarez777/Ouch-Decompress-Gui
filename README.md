@@ -66,8 +66,6 @@ AppImage.
 `tlz`, `cbt`), `zip` (`cbz`, `epub`), `7z` (`cb7`), `rar` (`cbr`), `gz`, `bz`,
 `bz2`, `bz3`, `xz`, `lzma`, `lz`, `lz4`, `sz`, `zst` and `br`.
 
-> RAR is decompression/listing only, due to the format's licensing.
-
 ## Known limitation: drag & drop on Wayland
 
 Dragging and dropping files onto the window **does not work on Wayland yet**.
