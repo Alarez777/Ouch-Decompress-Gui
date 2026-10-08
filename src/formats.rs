@@ -125,14 +125,23 @@ pub fn format_for_extension(extension: &str) -> Option<&'static FormatInfo> {
         .find(|format| format.extensions.contains(&extension.as_str()))
 }
 
+/// Removes a trailing numeric split extension (`a.7z.001` -> `a.7z`), which is
+/// not a format but a volume number. Returns `None` when there is none.
+fn strip_numeric_split(name: &str) -> Option<&str> {
+    let (prefix, last) = name.rsplit_once('.')?;
+    (!last.is_empty() && last.bytes().all(|byte| byte.is_ascii_digit())).then_some(prefix)
+}
+
 /// Walks the trailing extensions of a path and yields every recognized format,
 /// from the innermost (leftmost) to the outermost (rightmost).
 ///
-/// `archive.tar.gz` yields `[tar, gz]`; `photo.jpg` yields `[]`.
+/// `archive.tar.gz` yields `[tar, gz]`; `photo.jpg` yields `[]`;
+/// `def.7z.001` yields `[7z]` (the volume number is ignored).
 pub fn formats_in_path(path: &Path) -> Vec<&'static FormatInfo> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Vec::new();
     };
+    let name = strip_numeric_split(name).unwrap_or(name);
 
     // Walk the extensions from right to left, collecting the contiguous known
     // tail. `a.tar.gz` -> [tar, gz]; `my.file.tar.gz` -> [tar, gz].
@@ -161,7 +170,7 @@ pub fn stem_without_known_extensions(path: &Path) -> String {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return String::new();
     };
-    let strip = formats_in_path(path).len();
+    let strip = formats_in_path(path).len() + usize::from(strip_numeric_split(name).is_some());
     let parts: Vec<&str> = name.split('.').collect();
     if strip == 0 || parts.len() <= strip {
         return name.to_string();
@@ -217,6 +226,24 @@ mod tests {
         assert_eq!(
             stem_without_known_extensions(&PathBuf::from("plain.txt")),
             "plain.txt"
+        );
+    }
+
+    #[test]
+    fn ignores_numeric_split_extension() {
+        assert_eq!(outer_format(&PathBuf::from("def.7z.001")).unwrap().id, "7z");
+        assert!(is_archive_path(&PathBuf::from("def.7z.001")));
+        assert_eq!(
+            outer_format(&PathBuf::from("a.tar.gz.001")).unwrap().id,
+            "gz"
+        );
+        assert_eq!(
+            stem_without_known_extensions(&PathBuf::from("def.7z.001")),
+            "def"
+        );
+        assert_eq!(
+            stem_without_known_extensions(&PathBuf::from("a.tar.gz.001")),
+            "a"
         );
     }
 }

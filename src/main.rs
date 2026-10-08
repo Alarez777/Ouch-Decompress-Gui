@@ -11,6 +11,7 @@ mod formats;
 mod i18n;
 mod job;
 mod modes;
+mod multivolume;
 mod ouch;
 mod split;
 mod system;
