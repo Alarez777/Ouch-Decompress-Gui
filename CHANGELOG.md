@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.5] - 2026-10-08
 
+### Added
+
+- Support for numeric split archives (`name.7z.001`, `name.7z.002`, ...): the
+  volumes are joined into a temporary file — with a "Joining parts" phase — and
+  extracted as a single archive.
+- Missing volumes of a numeric split set are detected and reported before
+  extracting anything.
+
 ### Fixed
 
 - The Cancel button now stops the running extraction immediately by
