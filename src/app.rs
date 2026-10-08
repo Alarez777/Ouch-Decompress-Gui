@@ -121,6 +121,10 @@ pub struct App {
     overwrite_prompt: Option<OverwritePrompt>,
     password_input: String,
     new_password_input: String,
+    /// Text of the "add multiple passwords" dialog, one per line.
+    bulk_password_input: String,
+    /// Whether the "add multiple passwords" dialog is open.
+    bulk_password_open: bool,
     /// Set when a new password prompt appears, so its field gets focus once.
     password_focus: bool,
     applied_theme: Option<ThemeChoice>,
@@ -210,6 +214,8 @@ impl App {
             overwrite_prompt: None,
             password_input: String::new(),
             new_password_input: String::new(),
+            bulk_password_input: String::new(),
+            bulk_password_open: false,
             password_focus: false,
             applied_theme: None,
             confirm_disabled: None,
@@ -1184,11 +1190,13 @@ impl App {
             |ui, _class| {
                 if ui.ctx().input(|input| input.viewport().close_requested()) {
                     self.open_settings = false;
+                    self.bulk_password_open = false;
                     self.flush_config(true);
                     ui.ctx().request_repaint();
                     return;
                 }
                 egui::CentralPanel::default().show(ui, |ui| self.ui_settings(ui));
+                self.ui_bulk_password_modal(ui.ctx());
             },
         );
     }
@@ -1502,6 +1510,60 @@ impl App {
                 }
             }
         });
+
+        ui.add_space(6.0);
+        if ui.button(self.i18n.t("settings.add_multiple")).clicked() {
+            self.bulk_password_input.clear();
+            self.bulk_password_open = true;
+        }
+    }
+
+    fn ui_bulk_password_modal(&mut self, ctx: &egui::Context) {
+        if !self.bulk_password_open {
+            return;
+        }
+
+        let mut save = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("bulk-password-modal")).show(ctx, |ui| {
+            let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
+            ui.set_min_width(max_width.min(400.0));
+            ui.set_max_width(max_width);
+            ui.heading(self.i18n.t("settings.bulk_passwords.title"));
+            ui.label(
+                egui::RichText::new(self.i18n.t("settings.bulk_passwords.hint"))
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut self.bulk_password_input)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(self.i18n.t("settings.bulk_passwords.save"))
+                    .clicked()
+                {
+                    save = true;
+                }
+                if ui.button(self.i18n.t("common.cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if save {
+            self.config
+                .add_passwords_from_text(&self.bulk_password_input);
+            self.bulk_password_input.clear();
+            self.bulk_password_open = false;
+            self.persist();
+        } else if cancel {
+            self.bulk_password_input.clear();
+            self.bulk_password_open = false;
+        }
     }
 
     fn ui_password_modal(&mut self, ctx: &egui::Context) {

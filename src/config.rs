@@ -256,6 +256,21 @@ impl Config {
     pub fn is_format_disabled(&self, id: &str) -> bool {
         self.disabled_formats.iter().any(|disabled| disabled == id)
     }
+
+    /// Adds the usable passwords from `text`, one per line: trims each line and
+    /// skips empty or already-present ones. Returns how many were added.
+    pub fn add_passwords_from_text(&mut self, text: &str) -> usize {
+        let mut added = 0;
+        for line in text.lines() {
+            let password = line.trim();
+            if password.is_empty() || self.passwords.iter().any(|saved| saved == password) {
+                continue;
+            }
+            self.passwords.push(password.to_string());
+            added += 1;
+        }
+        added
+    }
 }
 
 #[cfg(test)]
@@ -312,5 +327,16 @@ mod tests {
     fn notifications_default_to_on_failure() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.notifications, Notifications::OnFailure);
+    }
+
+    #[test]
+    fn adds_passwords_from_text_skipping_duplicates() {
+        let mut config = Config {
+            passwords: vec!["keep".into()],
+            ..Config::default()
+        };
+        let added = config.add_passwords_from_text("a\n\n  b  \nkeep\na\n");
+        assert_eq!(added, 2);
+        assert_eq!(config.passwords, vec!["keep", "a", "b"]);
     }
 }
