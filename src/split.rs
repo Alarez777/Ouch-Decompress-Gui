@@ -61,6 +61,82 @@ fn rar_part_info(name: &str) -> Option<(&str, u64)> {
     Some((prefix, digits.parse().ok()?))
 }
 
+/// A multi-volume set that is missing some of its volumes.
+pub struct MissingParts {
+    /// The missing file names, matching the present parts' naming.
+    pub names: Vec<String>,
+    /// Total number of volumes, when the last present one is provably the
+    /// final volume (it is smaller than the previous one).
+    pub total: Option<u64>,
+}
+
+/// Reports the missing volumes of a multi-volume set, if any.
+///
+/// Volumes are numbered from 1 and expected to be contiguous, so a set whose
+/// first volumes are gone, or with gaps, is incomplete. Returns `None` when
+/// nothing is provably missing.
+pub fn missing_parts(parts: &[PathBuf]) -> Option<MissingParts> {
+    let mut numbered: Vec<(u64, &PathBuf)> = parts
+        .iter()
+        .filter_map(|path| part_number(path).map(|number| (number, path)))
+        .collect();
+    numbered.sort_by_key(|(number, _)| *number);
+    numbered.dedup_by_key(|(number, _)| *number);
+
+    let numbers: Vec<u64> = numbered.iter().map(|(number, _)| *number).collect();
+    let first = *numbers.first()?;
+
+    let mut missing: Vec<u64> = (1..first).collect();
+    for pair in numbers.windows(2) {
+        missing.extend((pair[0] + 1)..pair[1]);
+    }
+    if missing.is_empty() {
+        return None;
+    }
+
+    let template = numbered.first().map(|(_, path)| *path)?;
+    let names = missing
+        .iter()
+        .filter_map(|number| format_part_name(template, *number))
+        .collect();
+
+    Some(MissingParts {
+        names,
+        total: final_volume_total(&numbered),
+    })
+}
+
+/// The volume number of `path` when it is a `base.partN.rar` part.
+fn part_number(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    rar_part_info(name).map(|(_, number)| number)
+}
+
+/// The total number of volumes, when the last part is the final volume (all
+/// volumes but the last share a size, so a smaller last part is the end).
+fn final_volume_total(numbered: &[(u64, &PathBuf)]) -> Option<u64> {
+    let (last_number, last_path) = *numbered.last()?;
+    let (_, previous_path) = *numbered.get(numbered.len().checked_sub(2)?)?;
+    let last_size = std::fs::metadata(last_path).ok()?.len();
+    let previous_size = std::fs::metadata(previous_path).ok()?.len();
+    (last_size > 0 && last_size < previous_size).then_some(last_number)
+}
+
+/// Rebuilds the file name of a missing volume from an existing part, keeping
+/// its prefix, label, casing and digit width (`a.PART02.RAR` -> `a.PART01.RAR`).
+fn format_part_name(template: &Path, number: u64) -> Option<String> {
+    let name = template.file_name()?.to_str()?;
+    let (stem, extension) = name.rsplit_once('.')?;
+    let (prefix, part) = stem.rsplit_once('.')?;
+    let digit_count = part.chars().rev().take_while(char::is_ascii_digit).count();
+    if digit_count == 0 {
+        return None;
+    }
+    let label = &part[..part.len() - digit_count];
+    let width = digit_count;
+    Some(format!("{prefix}.{label}{number:0width$}.{extension}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +193,58 @@ mod tests {
                 .to_ascii_lowercase()
                 .starts_with("a.part")
         }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_part(dir: &Path, name: &str, size: usize) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![0u8; size]).unwrap();
+        path
+    }
+
+    #[test]
+    fn reports_leading_missing_parts() {
+        let dir = unique_dir("missing-leading");
+        let parts = vec![
+            write_part(&dir, "s.part2.rar", 100),
+            write_part(&dir, "s.part3.rar", 100),
+        ];
+        let missing = missing_parts(&parts).unwrap();
+        assert_eq!(missing.names, vec!["s.part1.rar".to_string()]);
+        assert_eq!(missing.total, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reports_gaps_between_parts() {
+        let dir = unique_dir("missing-gap");
+        let parts = vec![
+            write_part(&dir, "s.part1.rar", 100),
+            write_part(&dir, "s.part3.rar", 40),
+        ];
+        let missing = missing_parts(&parts).unwrap();
+        assert_eq!(missing.names, vec!["s.part2.rar".to_string()]);
+        assert_eq!(missing.total, Some(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn complete_set_reports_nothing() {
+        let dir = unique_dir("missing-none");
+        let parts = vec![
+            write_part(&dir, "s.part1.rar", 100),
+            write_part(&dir, "s.part2.rar", 40),
+        ];
+        assert!(missing_parts(&parts).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_digit_width_and_casing() {
+        let dir = unique_dir("missing-width");
+        let parts = vec![write_part(&dir, "s.PART02.RAR", 100)];
+        let missing = missing_parts(&parts).unwrap();
+        assert_eq!(missing.names, vec!["s.PART01.RAR".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

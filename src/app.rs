@@ -298,7 +298,7 @@ impl App {
             .map(|&index| self.files[index].path.clone())
             .collect();
         let config = self.config.clone();
-        let (controller, rx) = job::spawn(ouch, archives, config, ctx.clone());
+        let (controller, rx) = job::spawn(ouch, archives, config, self.i18n.clone(), ctx.clone());
         self.controller = Some(controller);
         self.event_rx = Some(rx);
         self.batch_indices = pending;
@@ -1584,15 +1584,20 @@ impl App {
         let mut extract = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::new("disabled-modal")).show(ctx, |ui| {
-            ui.set_min_width(380.0);
+            let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
+            ui.set_min_width(max_width.min(380.0));
+            ui.set_max_width(max_width);
             ui.heading(self.i18n.t("confirm_disabled.title"));
             ui.label(self.i18n.t("confirm_disabled.body"));
             for index in &indices {
                 if let Some(file) = self.files.get(*index) {
-                    ui.label(
-                        egui::RichText::new(format!("  {}", file.path.display()))
-                            .small()
-                            .monospace(),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("  {}", file.path.display()))
+                                .small()
+                                .monospace(),
+                        )
+                        .wrap(),
                     );
                 }
             }
@@ -1656,7 +1661,9 @@ impl App {
 
         let mut answer: Option<JobAnswer> = None;
         egui::Modal::new(egui::Id::new("overwrite-modal")).show(ctx, |ui| {
-            ui.set_min_width(420.0);
+            let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
+            ui.set_min_width(max_width.min(420.0));
+            ui.set_max_width(max_width);
             ui.heading(self.i18n.t("overwrite.title"));
             ui.label(self.i18n.t("overwrite.body"));
             egui::ScrollArea::vertical()
@@ -1664,10 +1671,13 @@ impl App {
                 .max_height(160.0)
                 .show(ui, |ui| {
                     for path in &conflicts {
-                        ui.label(
-                            egui::RichText::new(path.display().to_string())
-                                .small()
-                                .monospace(),
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(path.display().to_string())
+                                    .small()
+                                    .monospace(),
+                            )
+                            .wrap(),
                         );
                     }
                 });
@@ -1703,8 +1713,10 @@ impl App {
 
         let mut close = false;
         egui::Modal::new(egui::Id::new("error-modal")).show(ctx, |ui| {
-            ui.set_min_width(420.0);
-            ui.set_max_width(680.0);
+            // Never grow wider than the window, or the text gets clipped.
+            let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
+            ui.set_min_width(max_width.min(420.0));
+            ui.set_max_width(max_width);
             ui.heading(
                 egui::RichText::new(self.i18n.t("common.error"))
                     .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
@@ -1713,7 +1725,9 @@ impl App {
                 .id_salt("error-scroll")
                 .max_height(260.0)
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new(&message).monospace().small());
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&message).monospace().small()).wrap(),
+                    );
                 });
             ui.add_space(6.0);
             ui.horizontal(|ui| {

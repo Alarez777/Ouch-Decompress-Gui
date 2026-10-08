@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
 use crate::formats;
+use crate::i18n::I18n;
 use crate::modes::{self, DecompressMode, Target};
 use crate::ouch::OuchClient;
 use crate::split;
@@ -96,6 +97,7 @@ pub fn spawn(
     ouch: OuchClient,
     archives: Vec<PathBuf>,
     config: Config,
+    i18n: I18n,
     ctx: egui::Context,
 ) -> (JobController, Receiver<JobEvent>) {
     let (event_tx, event_rx) = mpsc::channel::<JobEvent>();
@@ -114,6 +116,7 @@ pub fn spawn(
             ouch,
             archives,
             config,
+            i18n,
             event_tx,
             answer_rx,
             cancel_all,
@@ -130,6 +133,7 @@ fn run(
     ouch: OuchClient,
     archives: Vec<PathBuf>,
     config: Config,
+    i18n: I18n,
     event_tx: Sender<JobEvent>,
     answer_rx: Receiver<JobAnswer>,
     cancel_all: Arc<AtomicBool>,
@@ -149,6 +153,7 @@ fn run(
             &ouch,
             archive,
             &config,
+            &i18n,
             &mut batch_password,
             &answer_rx,
             &event_tx,
@@ -167,6 +172,7 @@ fn process_one(
     ouch: &OuchClient,
     archive: &Path,
     config: &Config,
+    i18n: &I18n,
     batch_password: &mut Option<String>,
     answer_rx: &Receiver<JobAnswer>,
     event_tx: &Sender<JobEvent>,
@@ -186,6 +192,12 @@ fn process_one(
 
     // Every file of a multi-volume set, for the post-extraction cleanup.
     let cleanup_parts = split::archive_parts(archive);
+
+    // Fail before touching the disk when volumes are missing; extracting the
+    // remaining parts would just produce garbage and waste space.
+    if let Some(missing) = split::missing_parts(&cleanup_parts) {
+        return fail(index, missing_parts_message(i18n, &missing));
+    }
 
     // Logs each `ouch` command as it runs.
     let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
@@ -724,6 +736,18 @@ fn looks_like_crash(message: &str) -> bool {
     message.contains("signal:") || message.contains("exit status")
 }
 
+/// Builds the localized message for a multi-volume set with missing volumes.
+fn missing_parts_message(i18n: &I18n, missing: &split::MissingParts) -> String {
+    let names = missing.names.join(", ");
+    match missing.total {
+        Some(total) => i18n
+            .t("error.missing_parts_of")
+            .replace("{names}", &names)
+            .replace("{total}", &total.to_string()),
+        None => i18n.t("error.missing_parts").replace("{names}", &names),
+    }
+}
+
 /// Parses the `rchar` field (bytes read via syscalls) from `/proc/<pid>/io`.
 fn parse_rchar(contents: &str) -> Option<u64> {
     contents
@@ -1152,10 +1176,12 @@ mod tests {
         }
 
         let current_pid = Arc::new(AtomicU32::new(0));
+        let i18n = I18n::new(crate::i18n::Language::En);
         let event = process_one(
             ouch,
             archive,
             config,
+            &i18n,
             &mut batch_password,
             &answer_rx,
             &event_tx,
@@ -1274,6 +1300,46 @@ mod tests {
             base.join("multi.part1").join("one.txt").exists(),
             "multiple roots should create a folder"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_first_volume_fails_clearly() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        let base = unique_dir("missing-first");
+        std::fs::write(base.join("Payload.iso"), vec![9u8; 200_000]).unwrap();
+        let Some(_first) = build_multipart_rar(&base, &["Payload.iso"], "multi.rar", "100k") else {
+            eprintln!("skipping: rar tool not found");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        std::fs::remove_file(base.join("Payload.iso")).unwrap();
+        // Remove the first volume and open the second one.
+        std::fs::remove_file(base.join("multi.part1.rar")).unwrap();
+        let second = base.join("multi.part2.rar");
+        assert!(second.exists());
+
+        let config = Config {
+            decompress_mode: DecompressMode::Smart,
+            conflict_policy: ConflictPolicy::Overwrite,
+            after_extract: AfterExtract::Keep,
+            ..Config::default()
+        };
+        let (event, _) = run_process_one(&ouch, &second, &config);
+
+        match event {
+            JobEvent::Done {
+                success, message, ..
+            } => {
+                assert!(!success, "should fail");
+                assert!(message.contains("multi.part1.rar"), "message: {message}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(!base.join("Payload.iso").exists(), "must not extract");
         let _ = std::fs::remove_dir_all(&base);
     }
 
