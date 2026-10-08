@@ -718,6 +718,12 @@ fn is_password_error(message: &str) -> bool {
     message.contains("password") || message.contains("encrypt") || message.contains("decrypt")
 }
 
+/// Heuristic: a crash (or an unexplained non-zero exit) may be an encrypted
+/// archive that `ouch` cannot describe without the password.
+fn looks_like_crash(message: &str) -> bool {
+    message.contains("signal:") || message.contains("exit status")
+}
+
 /// Parses the `rchar` field (bytes read via syscalls) from `/proc/<pid>/io`.
 fn parse_rchar(contents: &str) -> Option<u64> {
     contents
@@ -840,10 +846,11 @@ enum SkipReason {
 }
 
 /// Tries to list an archive using, in order: no password, the batch password,
-/// then every saved password. If a password is required, asks the user until a
-/// password works or the user skips/cancels. Non-password failures are
-/// returned as [`SkipReason::HardError`] so the caller never asks for a
-/// password the archive does not have.
+/// then every saved password. If a password is required — or `ouch` crashes,
+/// which may hide an encrypted archive — it asks the user until a password
+/// works or the user skips/cancels. Other failures are returned as
+/// [`SkipReason::HardError`] so the caller never asks for a password the
+/// archive does not have.
 #[allow(clippy::too_many_arguments)]
 fn obtain_listing(
     ouch: &OuchClient,
@@ -888,7 +895,9 @@ fn obtain_listing(
         }
     }
 
-    if !password_related {
+    // A crash may hide an encrypted archive that `ouch list` cannot describe
+    // without the password, so it is worth offering the password prompt.
+    if !password_related && !looks_like_crash(&last_error) {
         return Err(SkipReason::HardError(last_error));
     }
 
@@ -957,6 +966,13 @@ mod tests {
         ));
         assert!(!is_password_error("No such file or directory (os error 2)"));
         assert!(!is_password_error("It is not a valid archive"));
+    }
+
+    #[test]
+    fn treats_crashes_as_ambiguous() {
+        assert!(looks_like_crash("ouch list failed: signal: 11 (SIGSEGV)"));
+        assert!(looks_like_crash("ouch list failed: exit status: 1"));
+        assert!(!looks_like_crash("ouch list failed: not a valid archive"));
     }
 
     #[test]
