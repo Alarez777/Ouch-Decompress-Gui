@@ -16,6 +16,7 @@ use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
 use crate::formats;
 use crate::i18n::I18n;
 use crate::modes::{self, DecompressMode, Target};
+use crate::multivolume;
 use crate::ouch::OuchClient;
 use crate::split;
 
@@ -209,6 +210,39 @@ fn process_one(
     let _progress =
         ProgressPoller::spawn(index, &cleanup_parts, current_pid.clone(), event_tx, ctx);
 
+    // Prepare the file `ouch` should read. For a raw split (`name.7z.001`) this
+    // concatenates the volumes into a temporary (see `multivolume`); other
+    // archives are returned untouched. `workdir` keeps the output next to the
+    // original even when the temporary lives elsewhere (e.g. /dev/shm).
+    let prepared = match multivolume::prepare(
+        archive,
+        &cleanup_parts,
+        split::kind(archive),
+        |copied, total| {
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                copied as f32 / total as f32
+            };
+            let _ = send(
+                event_tx,
+                ctx,
+                JobEvent::Progress {
+                    index,
+                    fraction,
+                    total,
+                    part_index: 0,
+                },
+            );
+            ctx.request_repaint();
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => return fail(index, err.to_string()),
+    };
+    let source = prepared.path();
+    let workdir = parent_dir(archive);
+
     let is_archive = formats::is_archive_path(archive);
 
     if let Some(format) = formats::outer_format(archive) {
@@ -235,7 +269,7 @@ fn process_one(
             return fail(index, message);
         }
         let result = result_name(archive, false, None);
-        return match ouch.decompress(archive, Target::Here, None, current_pid, &log) {
+        return match ouch.decompress(source, &workdir, Target::Here, None, current_pid, &log) {
             Ok(outcome) if outcome.success => finish_success(
                 index,
                 archive,
@@ -264,7 +298,7 @@ fn process_one(
 
     match obtain_listing(
         ouch,
-        archive,
+        source,
         config,
         batch_password,
         answer_rx,
@@ -344,7 +378,14 @@ fn process_one(
     let mut last_error = String::new();
     let mut password_related = false;
     for candidate in candidates {
-        match ouch.decompress(archive, target, candidate.as_deref(), current_pid, &log) {
+        match ouch.decompress(
+            source,
+            &workdir,
+            target,
+            candidate.as_deref(),
+            current_pid,
+            &log,
+        ) {
             Ok(outcome) if outcome.success => {
                 if candidate.is_some() {
                     *batch_password = candidate;
@@ -390,7 +431,8 @@ fn process_one(
         first_prompt = false;
         match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
             JobAnswer::Password(password) => {
-                match ouch.decompress(archive, target, Some(&password), current_pid, &log) {
+                match ouch.decompress(source, &workdir, target, Some(&password), current_pid, &log)
+                {
                     Ok(outcome) if outcome.success => {
                         *batch_password = Some(password);
                         return finish_success(
@@ -1232,6 +1274,64 @@ mod tests {
         } else {
             dir.join(base)
         })
+    }
+
+    /// Builds a numeric split (`base.7z.001`, ...) with the `7z` tool and
+    /// returns its first part, or `None` when `7z` is not available.
+    fn build_split_7z(dir: &Path, inputs: &[&str], base: &str, volume: &str) -> Option<PathBuf> {
+        let status = Command::new("7z")
+            .current_dir(dir)
+            .args(["a", "-y", "-bso0", "-bsp0", "-mx0"])
+            .arg(format!("-v{volume}"))
+            .arg(base)
+            .args(inputs)
+            .stdin(Stdio::null())
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        let first = dir.join(format!("{base}.001"));
+        Some(if first.exists() {
+            first
+        } else {
+            dir.join(base)
+        })
+    }
+
+    #[test]
+    fn extracts_split_7z_by_concatenating() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        let base = unique_dir("split-7z");
+        std::fs::write(base.join("Payload.iso"), vec![5u8; 300_000]).unwrap();
+        let Some(first) = build_split_7z(&base, &["Payload.iso"], "multi.7z", "100k") else {
+            eprintln!("skipping: 7z tool not found");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        std::fs::remove_file(base.join("Payload.iso")).unwrap();
+        assert!(
+            base.join("multi.7z.002").exists(),
+            "the archive should have been split"
+        );
+
+        let config = Config {
+            decompress_mode: DecompressMode::Smart,
+            conflict_policy: ConflictPolicy::Overwrite,
+            after_extract: AfterExtract::Keep,
+            ..Config::default()
+        };
+        let (event, _) = run_process_one(&ouch, &first, &config);
+
+        assert!(
+            matches!(event, JobEvent::Done { success: true, .. }),
+            "event: {event:?}"
+        );
+        assert!(base.join("Payload.iso").exists(), "should extract the file");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -143,28 +143,23 @@ impl OuchClient {
 
     /// Runs `ouch decompress` for a single archive.
     ///
-    /// The working directory is set to the archive's parent so that ouch's
-    /// native "stem folder" and `--here` behaviors land next to the archive
-    /// regardless of where the app was launched from.
+    /// `workdir` is where the extraction happens (the archive's own directory
+    /// in the normal case); it is separate from `archive` so a prepared source
+    /// (e.g. a concatenated temporary) can still extract next to the original.
     ///
     /// While the child runs, `pid_slot` holds its PID (or 0), so the progress
     /// poller can read the child's `/proc/<pid>/io`.
     pub fn decompress(
         &self,
         archive: &Path,
+        workdir: &Path,
         target: Target,
         password: Option<&str>,
         pid_slot: &AtomicU32,
         log: &dyn Fn(&str),
     ) -> Result<DecompressOutcome> {
-        let workdir = archive
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-
         let mut cmd = self.command();
-        cmd.current_dir(&workdir);
+        cmd.current_dir(workdir);
         cmd.arg("decompress").arg("-y");
         if target == Target::Here {
             cmd.arg("--here");
@@ -326,7 +321,14 @@ mod tests {
         );
 
         let outcome = ouch
-            .decompress(&multi, Target::Folder, None, &AtomicU32::new(0), &|_| {})
+            .decompress(
+                &multi,
+                multi.parent().unwrap(),
+                Target::Folder,
+                None,
+                &AtomicU32::new(0),
+                &|_| {},
+            )
             .unwrap();
         assert!(outcome.success, "decompress failed: {}", outcome.stderr);
         assert!(multi_dir.join("multi/a.txt").exists());
@@ -348,7 +350,14 @@ mod tests {
         );
 
         let outcome = ouch
-            .decompress(&single, Target::Here, None, &AtomicU32::new(0), &|_| {})
+            .decompress(
+                &single,
+                single.parent().unwrap(),
+                Target::Here,
+                None,
+                &AtomicU32::new(0),
+                &|_| {},
+            )
             .unwrap();
         assert!(outcome.success, "decompress failed: {}", outcome.stderr);
         assert!(single_dir.join("source/one/file.txt").exists());
