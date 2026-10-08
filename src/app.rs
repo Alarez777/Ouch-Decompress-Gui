@@ -1552,6 +1552,8 @@ impl App {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            // Keep the button clear of the scrollbar.
+                                            ui.add_space(8.0);
                                             if ui.small_button("x").clicked() {
                                                 remove = Some(index);
                                             }
