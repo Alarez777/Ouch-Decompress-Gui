@@ -54,12 +54,14 @@ pub enum JobEvent {
     /// Approximate progress of the archive currently being extracted.
     /// `fraction` is `0.0..=1.0`, computed from the bytes `ouch` has read from
     /// the archive versus its total size. For a multi-volume set `part_index`
-    /// is the volume being read. `total == 0` means unknown.
+    /// is the volume being read. `total == 0` means unknown. `speed_bps` is the
+    /// smoothed write rate in bytes per second (`0` when not extracted yet).
     Progress {
         index: usize,
         fraction: f32,
         total: u64,
         part_index: usize,
+        speed_bps: u64,
     },
     Done {
         index: usize,
@@ -254,6 +256,7 @@ fn process_one(
                     fraction,
                     total,
                     part_index: 0,
+                    speed_bps: 0,
                 },
             );
             ctx.request_repaint();
@@ -846,10 +849,32 @@ fn parse_rchar(contents: &str) -> Option<u64> {
         .find_map(|line| line.strip_prefix("rchar:")?.trim().parse::<u64>().ok())
 }
 
-/// Bytes read by the given process so far, from `/proc/<pid>/io`.
-fn process_read_bytes(pid: u32) -> Option<u64> {
+/// Parses the `wchar` field (bytes written via syscalls) from `/proc/<pid>/io`.
+fn parse_wchar(contents: &str) -> Option<u64> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("wchar:")?.trim().parse::<u64>().ok())
+}
+
+/// Bytes read and written by the given process so far, from `/proc/<pid>/io`.
+fn process_io(pid: u32) -> Option<(u64, u64)> {
     let contents = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
-    parse_rchar(&contents)
+    let read = parse_rchar(&contents)?;
+    let write = parse_wchar(&contents).unwrap_or(0);
+    Some((read, write))
+}
+
+/// Exponential moving average of a transfer rate. `previous` is `None` on the
+/// first sample, so the rate starts at the instantaneous value.
+fn smooth_speed(previous: Option<f64>, delta_bytes: u64, secs: f64) -> f64 {
+    if secs <= 0.0 {
+        return previous.unwrap_or(0.0);
+    }
+    let instant = delta_bytes as f64 / secs;
+    match previous {
+        Some(prev) => 0.3 * instant + 0.7 * prev,
+        None => instant,
+    }
 }
 
 /// Stops the progress poller thread when dropped.
@@ -886,6 +911,7 @@ impl ProgressPoller {
             fraction: 0.0,
             total,
             part_index: 0,
+            speed_bps: 0,
         });
         ctx.request_repaint();
         let (stop_tx, stop_rx) = mpsc::channel();
@@ -921,10 +947,28 @@ fn run_progress_poller(
     ctx: egui::Context,
     stop_rx: Receiver<()>,
 ) {
+    // Write-speed tracking. Reset whenever the child changes (a new attempt
+    // after a wrong password starts a fresh `/proc/<pid>/io` counter).
+    let mut last_pid = 0u32;
+    let mut last_write = 0u64;
+    let mut last_time = std::time::Instant::now();
+    let mut speed: Option<f64> = None;
     loop {
         let pid = pid_slot.load(Ordering::Relaxed);
         if pid != 0 {
-            if let Some(read) = process_read_bytes(pid) {
+            if let Some((read, write)) = process_io(pid) {
+                let now = std::time::Instant::now();
+                if pid != last_pid {
+                    last_pid = pid;
+                    last_write = write;
+                    last_time = now;
+                    speed = None;
+                } else {
+                    let dt = now.duration_since(last_time).as_secs_f64();
+                    speed = Some(smooth_speed(speed, write.saturating_sub(last_write), dt));
+                    last_write = write;
+                    last_time = now;
+                }
                 let fraction = (read as f64 / total as f64).min(1.0) as f32;
                 let part_index = part_index_for(read, &cumulative);
                 let _ = event_tx.send(JobEvent::Progress {
@@ -932,6 +976,7 @@ fn run_progress_poller(
                     fraction,
                     total,
                     part_index,
+                    speed_bps: speed.unwrap_or(0.0) as u64,
                 });
                 ctx.request_repaint();
             }
@@ -1124,6 +1169,24 @@ mod tests {
         assert_eq!(parse_rchar("rchar: 12345\nwchar: 678\n"), Some(12345));
         assert_eq!(parse_rchar("wchar: 1\nsyscr: 2\n"), None);
         assert_eq!(parse_rchar(""), None);
+    }
+
+    #[test]
+    fn parses_wchar_from_proc_io() {
+        assert_eq!(parse_wchar("rchar: 12345\nwchar: 678\n"), Some(678));
+        assert_eq!(parse_wchar("rchar: 1\nsyscw: 2\n"), None);
+        assert_eq!(parse_wchar(""), None);
+    }
+
+    #[test]
+    fn smooths_write_speed() {
+        // First sample is instantaneous.
+        assert_eq!(smooth_speed(None, 1_000_000, 1.0), 1_000_000.0);
+        // Later samples blend 30% of the new rate into the average.
+        let smoothed = smooth_speed(Some(1_000_000.0), 2_000_000, 1.0);
+        assert!((smoothed - 1_300_000.0).abs() < 1.0);
+        // A zero interval keeps the previous value.
+        assert_eq!(smooth_speed(Some(42.0), 999, 0.0), 42.0);
     }
 
     #[test]
