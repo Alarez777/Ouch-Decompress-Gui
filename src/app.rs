@@ -16,6 +16,10 @@ use crate::modes::DecompressMode;
 use crate::ouch::OuchClient;
 use crate::theme::{self, ThemeChoice};
 
+/// Highlights the "joining parts" phase, so it is clear the split volumes are
+/// being joined and the archive is not being extracted yet.
+const JOINING_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
+
 /// Tabs inside the settings window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
@@ -882,7 +886,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(self.i18n.t("extract.joining"))
                             .small()
-                            .color(egui::Color32::GRAY),
+                            .color(JOINING_COLOR),
                     );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -906,9 +910,26 @@ impl App {
             }
 
             if total > 0 {
-                ui.add(egui::ProgressBar::new(fraction).text(format!("{:.0}%", fraction * 100.0)));
+                let text = if self.joining {
+                    self.i18n.t("extract.joining_bar")
+                } else {
+                    format!("{:.0}%", fraction * 100.0)
+                };
+                let bar = egui::ProgressBar::new(fraction).text(text);
+                let bar = if self.joining {
+                    bar.fill(JOINING_COLOR)
+                } else {
+                    bar
+                };
+                ui.add(bar);
             } else {
-                ui.add(egui::ProgressBar::new(0.0).animate(true));
+                let bar = egui::ProgressBar::new(0.0).animate(true);
+                let bar = if self.joining {
+                    bar.fill(JOINING_COLOR)
+                } else {
+                    bar
+                };
+                ui.add(bar);
             }
         } else if !self.status_line.is_empty() {
             ui.label(self.status_line.clone());

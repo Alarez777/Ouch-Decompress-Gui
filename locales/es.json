@@ -13,6 +13,7 @@
   "extract.all_done": "Todos los archivos procesados.",
   "extract.parts": "{count} partes",
   "extract.joining": "Uniendo partes…",
+  "extract.joining_bar": "UNIENDO",
   "progress.elapsed": "Transcurrido {time}",
   "status.pending": "Pendiente",
   "status.running": "En curso",
