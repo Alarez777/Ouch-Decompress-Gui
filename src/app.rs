@@ -858,80 +858,7 @@ impl App {
             ui.label(self.i18n.t("ouch.not_found_hint"));
         }
 
-        if self.running {
-            let (fraction, total, _) = self.progress;
-            let running = self
-                .files
-                .iter()
-                .find(|file| file.status == Status::Running);
-            let name = running
-                .and_then(|file| file.path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.status_line_line());
-            let parts = running.map_or(0, |file| file.parts.len());
-            let elapsed = self
-                .batch_started
-                .map(|started| started.elapsed().as_secs());
-            let mut cancel_clicked = false;
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(name).truncate());
-                if parts > 1 {
-                    let hint = self
-                        .i18n
-                        .t("extract.parts")
-                        .replace("{count}", &parts.to_string());
-                    ui.label(egui::RichText::new(hint).small().color(egui::Color32::GRAY));
-                }
-                if self.joining {
-                    ui.label(
-                        egui::RichText::new(self.i18n.t("extract.joining"))
-                            .small()
-                            .color(JOINING_COLOR),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(self.i18n.t("common.cancel")).clicked() {
-                        cancel_clicked = true;
-                    }
-                    if let Some(secs) = elapsed {
-                        ui.label(
-                            egui::RichText::new(
-                                self.i18n
-                                    .t("progress.elapsed")
-                                    .replace("{time}", &format_duration(secs)),
-                            )
-                            .color(egui::Color32::GRAY),
-                        );
-                    }
-                });
-            });
-            if cancel_clicked {
-                self.cancel_batch();
-            }
-
-            if total > 0 {
-                let text = if self.joining {
-                    self.i18n.t("extract.joining_bar")
-                } else {
-                    format!("{:.0}%", fraction * 100.0)
-                };
-                let bar = egui::ProgressBar::new(fraction).text(text);
-                let bar = if self.joining {
-                    bar.fill(JOINING_COLOR)
-                } else {
-                    bar
-                };
-                ui.add(bar);
-            } else {
-                let bar = egui::ProgressBar::new(0.0).animate(true);
-                let bar = if self.joining {
-                    bar.fill(JOINING_COLOR)
-                } else {
-                    bar
-                };
-                ui.add(bar);
-            }
-        } else if !self.status_line.is_empty() {
+        if !self.running && !self.status_line.is_empty() {
             ui.label(self.status_line.clone());
         }
 
@@ -945,6 +872,11 @@ impl App {
                 );
             });
         } else {
+            let (fraction, total, _) = self.progress;
+            let elapsed = self
+                .batch_started
+                .map(|started| started.elapsed().as_secs());
+            let mut cancel_clicked = false;
             // Volume currently being read, shown next to the running entry.
             let running_part = self.progress.2;
             egui::ScrollArea::vertical()
@@ -953,6 +885,24 @@ impl App {
                     let mut remove: Option<usize> = None;
                     let mut open: Option<PathBuf> = None;
                     for (index, file) in self.files.iter().enumerate() {
+                        if file.status == Status::Running {
+                            let bar = if total > 0 {
+                                let text = if self.joining {
+                                    self.i18n.t("extract.joining_bar")
+                                } else {
+                                    format!("{:.0}%", fraction * 100.0)
+                                };
+                                egui::ProgressBar::new(fraction).text(text)
+                            } else {
+                                egui::ProgressBar::new(0.0).animate(true)
+                            };
+                            let bar = if self.joining {
+                                bar.fill(JOINING_COLOR)
+                            } else {
+                                bar
+                            };
+                            ui.add(bar).scroll_to_me(Some(egui::Align::Center));
+                        }
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(self.i18n.t(file.status.label_key()))
@@ -1000,6 +950,13 @@ impl App {
                                         .join("\n"),
                                 );
                             }
+                            if file.status == Status::Running && self.joining {
+                                ui.label(
+                                    egui::RichText::new(self.i18n.t("extract.joining"))
+                                        .small()
+                                        .color(JOINING_COLOR),
+                                );
+                            }
                             if file.status == Status::Failed && !file.message.is_empty() {
                                 ui.label(
                                     egui::RichText::new(&file.message)
@@ -1010,21 +967,37 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if !self.running && ui.small_button("x").clicked() {
-                                        remove = Some(index);
-                                    }
-                                    if file.status == Status::Done
-                                        && ui
-                                            .small_button(self.i18n.t("extract.open_folder"))
-                                            .clicked()
-                                    {
-                                        open = Some(
-                                            file.path
-                                                .parent()
-                                                .filter(|parent| !parent.as_os_str().is_empty())
-                                                .map(PathBuf::from)
-                                                .unwrap_or_else(|| PathBuf::from(".")),
-                                        );
+                                    if file.status == Status::Running {
+                                        if ui.button(self.i18n.t("common.cancel")).clicked() {
+                                            cancel_clicked = true;
+                                        }
+                                        if let Some(secs) = elapsed {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    self.i18n
+                                                        .t("progress.elapsed")
+                                                        .replace("{time}", &format_duration(secs)),
+                                                )
+                                                .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                    } else {
+                                        if !self.running && ui.small_button("x").clicked() {
+                                            remove = Some(index);
+                                        }
+                                        if file.status == Status::Done
+                                            && ui
+                                                .small_button(self.i18n.t("extract.open_folder"))
+                                                .clicked()
+                                        {
+                                            open = Some(
+                                                file.path
+                                                    .parent()
+                                                    .filter(|parent| !parent.as_os_str().is_empty())
+                                                    .map(PathBuf::from)
+                                                    .unwrap_or_else(|| PathBuf::from(".")),
+                                            );
+                                        }
                                     }
                                 },
                             );
@@ -1037,6 +1010,9 @@ impl App {
                         self.files.remove(index);
                     }
                 });
+            if cancel_clicked {
+                self.cancel_batch();
+            }
         }
     }
 
@@ -1220,14 +1196,6 @@ impl App {
                 ui.ctx().request_repaint();
             }
         });
-    }
-
-    fn status_line_line(&self) -> String {
-        if self.status_line.is_empty() {
-            self.i18n.t("extract.working")
-        } else {
-            self.status_line.clone()
-        }
     }
 
     fn show_settings_viewport(&mut self, ctx: &egui::Context) {
