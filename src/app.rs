@@ -910,8 +910,12 @@ impl App {
             }
 
             if total > 0 {
-                let bar =
-                    egui::ProgressBar::new(fraction).text(format!("{:.0}%", fraction * 100.0));
+                let text = if self.joining {
+                    self.i18n.t("extract.joining_bar")
+                } else {
+                    format!("{:.0}%", fraction * 100.0)
+                };
+                let bar = egui::ProgressBar::new(fraction).text(text);
                 let bar = if self.joining {
                     bar.fill(JOINING_COLOR)
                 } else {

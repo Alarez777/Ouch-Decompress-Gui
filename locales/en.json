@@ -13,6 +13,7 @@
   "extract.all_done": "All archives processed.",
   "extract.parts": "{count} parts",
   "extract.joining": "Joining parts…",
+  "extract.joining_bar": "JOINING",
   "progress.elapsed": "Elapsed {time}",
   "status.pending": "Pending",
   "status.running": "Running",
