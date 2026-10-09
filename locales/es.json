@@ -15,6 +15,7 @@
   "extract.joining": "Uniendo partes…",
   "extract.joining_bar": "UNIENDO",
   "progress.elapsed": "Transcurrido {time}",
+  "progress.eta": "ETA {time}",
   "status.pending": "Pendiente",
   "status.running": "En curso",
   "status.done": "Listo",

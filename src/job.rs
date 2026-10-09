@@ -56,12 +56,15 @@ pub enum JobEvent {
     /// the archive versus its total size. For a multi-volume set `part_index`
     /// is the volume being read. `total == 0` means unknown. `speed_bps` is the
     /// smoothed write rate in bytes per second (`0` when not extracted yet).
+    /// `eta_secs` is the estimated seconds left from the read rate (`0` when
+    /// unknown).
     Progress {
         index: usize,
         fraction: f32,
         total: u64,
         part_index: usize,
         speed_bps: u64,
+        eta_secs: u64,
     },
     Done {
         index: usize,
@@ -257,6 +260,7 @@ fn process_one(
                     total,
                     part_index: 0,
                     speed_bps: 0,
+                    eta_secs: 0,
                 },
             );
             ctx.request_repaint();
@@ -885,6 +889,12 @@ fn smooth_speed(previous: Option<f64>, delta_bytes: u64, secs: f64) -> f64 {
     }
 }
 
+/// Estimated seconds left for `remaining` bytes at `rate` bytes per second.
+/// Returns `None` when the rate is not positive.
+fn estimate_eta(remaining: u64, rate: f64) -> Option<u64> {
+    (rate > 0.0).then(|| (remaining as f64 / rate) as u64)
+}
+
 /// Stops the progress poller thread when dropped.
 struct ProgressPoller {
     stop_tx: Sender<()>,
@@ -920,6 +930,7 @@ impl ProgressPoller {
             total,
             part_index: 0,
             speed_bps: 0,
+            eta_secs: 0,
         });
         ctx.request_repaint();
         let (stop_tx, stop_rx) = mpsc::channel();
@@ -955,14 +966,16 @@ fn run_progress_poller(
     ctx: egui::Context,
     stop_rx: Receiver<()>,
 ) {
-    // Write-speed tracking. The rate is averaged over a ~1 s window and only
-    // refreshed that often, so the number stays readable. Reset whenever the
+    // Speed/ETA tracking. Both rates are averaged over a ~1 s window and only
+    // refreshed that often, so the numbers stay readable. Reset whenever the
     // child changes (a new attempt after a wrong password starts a fresh
     // `/proc/<pid>/io` counter).
     let mut last_pid = 0u32;
+    let mut last_speed_read = 0u64;
     let mut last_speed_write = 0u64;
     let mut last_speed_time = std::time::Instant::now();
-    let mut speed: Option<f64> = None;
+    let mut read_speed: Option<f64> = None;
+    let mut write_speed: Option<f64> = None;
     loop {
         let pid = pid_slot.load(Ordering::Relaxed);
         if pid != 0 {
@@ -970,29 +983,40 @@ fn run_progress_poller(
                 let now = std::time::Instant::now();
                 if pid != last_pid {
                     last_pid = pid;
+                    last_speed_read = read;
                     last_speed_write = write;
                     last_speed_time = now;
-                    speed = None;
+                    read_speed = None;
+                    write_speed = None;
                 } else {
                     let window = now.duration_since(last_speed_time).as_secs_f64();
                     if window >= 1.0 {
-                        speed = Some(smooth_speed(
-                            speed,
+                        read_speed = Some(smooth_speed(
+                            read_speed,
+                            read.saturating_sub(last_speed_read),
+                            window,
+                        ));
+                        write_speed = Some(smooth_speed(
+                            write_speed,
                             write.saturating_sub(last_speed_write),
                             window,
                         ));
+                        last_speed_read = read;
                         last_speed_write = write;
                         last_speed_time = now;
                     }
                 }
                 let fraction = (read as f64 / total as f64).min(1.0) as f32;
                 let part_index = part_index_for(read, &cumulative);
+                let eta_secs = estimate_eta(total.saturating_sub(read), read_speed.unwrap_or(0.0))
+                    .unwrap_or(0);
                 let _ = event_tx.send(JobEvent::Progress {
                     index,
                     fraction,
                     total,
                     part_index,
-                    speed_bps: speed.unwrap_or(0.0) as u64,
+                    speed_bps: write_speed.unwrap_or(0.0) as u64,
+                    eta_secs,
                 });
                 ctx.request_repaint();
             }
@@ -1206,6 +1230,15 @@ mod tests {
         assert!(smoothed > 1_000_000.0 && smoothed < 2_000_000.0);
         // A zero interval keeps the previous value.
         assert_eq!(smooth_speed(Some(42.0), 999, 0.0), 42.0);
+    }
+
+    #[test]
+    fn estimates_eta_from_remaining_bytes_and_rate() {
+        assert_eq!(estimate_eta(0, 1_000_000.0), Some(0));
+        assert_eq!(estimate_eta(1_000_000, 1_000_000.0), Some(1));
+        assert_eq!(estimate_eta(3_000_000, 1_000_000.0), Some(3));
+        // A non-positive rate means the ETA is unknown.
+        assert_eq!(estimate_eta(1_000_000, 0.0), None);
     }
 
     #[test]

@@ -163,6 +163,8 @@ pub struct App {
     progress: (f32, u64, usize),
     /// Smoothed write rate of the archive being extracted, in bytes per second.
     write_speed: u64,
+    /// Estimated seconds left for the archive being extracted (`0` = unknown).
+    eta_secs: u64,
     /// True while the current archive is being prepared (split parts joined)
     /// rather than extracted.
     joining: bool,
@@ -241,6 +243,7 @@ impl App {
             restart_pending: false,
             progress: (0.0, 0, 0),
             write_speed: 0,
+            eta_secs: 0,
             joining: false,
             batch_started: None,
         };
@@ -311,6 +314,7 @@ impl App {
         self.results.clear();
         self.progress = (0.0, 0, 0);
         self.write_speed = 0;
+        self.eta_secs = 0;
         self.batch_started = Some(std::time::Instant::now());
 
         let archives: Vec<PathBuf> = pending
@@ -411,6 +415,7 @@ impl App {
                 }
                 self.progress = (0.0, 0, 0);
                 self.write_speed = 0;
+                self.eta_secs = 0;
                 self.joining = false;
                 self.status_line = self.i18n.t("extract.working");
             }
@@ -431,11 +436,13 @@ impl App {
                 total,
                 part_index,
                 speed_bps,
+                eta_secs,
             } => {
                 if let Some(file_index) = self.file_index(index) {
                     if self.files[file_index].status == Status::Running {
                         self.progress = (fraction, total, part_index);
                         self.write_speed = speed_bps;
+                        self.eta_secs = eta_secs;
                     }
                 }
             }
@@ -513,6 +520,7 @@ impl App {
                 self.event_rx = None;
                 self.progress = (0.0, 0, 0);
                 self.write_speed = 0;
+                self.eta_secs = 0;
                 self.joining = false;
                 self.batch_started = None;
                 self.confirm_close = false;
@@ -1006,6 +1014,17 @@ impl App {
                                                     self.i18n
                                                         .t("progress.elapsed")
                                                         .replace("{time}", &format_duration(secs)),
+                                                )
+                                                .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                        if self.eta_secs > 0 {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    self.i18n.t("progress.eta").replace(
+                                                        "{time}",
+                                                        &format_duration(self.eta_secs),
+                                                    ),
                                                 )
                                                 .color(egui::Color32::GRAY),
                                             );

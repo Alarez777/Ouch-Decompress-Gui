@@ -15,6 +15,7 @@
   "extract.joining": "Joining parts…",
   "extract.joining_bar": "JOINING",
   "progress.elapsed": "Elapsed {time}",
+  "progress.eta": "ETA {time}",
   "status.pending": "Pending",
   "status.running": "Running",
   "status.done": "Done",
