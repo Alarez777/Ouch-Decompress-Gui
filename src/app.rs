@@ -161,6 +161,8 @@ pub struct App {
     /// `(fraction, total_bytes, part_index)`. `total == 0` means unknown, so
     /// the bar is shown as indeterminate.
     progress: (f32, u64, usize),
+    /// Smoothed write rate of the archive being extracted, in bytes per second.
+    write_speed: u64,
     /// True while the current archive is being prepared (split parts joined)
     /// rather than extracted.
     joining: bool,
@@ -238,6 +240,7 @@ impl App {
             results: Vec::new(),
             restart_pending: false,
             progress: (0.0, 0, 0),
+            write_speed: 0,
             joining: false,
             batch_started: None,
         };
@@ -307,6 +310,7 @@ impl App {
         self.cleanup_failures = 0;
         self.results.clear();
         self.progress = (0.0, 0, 0);
+        self.write_speed = 0;
         self.batch_started = Some(std::time::Instant::now());
 
         let archives: Vec<PathBuf> = pending
@@ -406,6 +410,7 @@ impl App {
                     self.push_log(format!("-> {}", self.file_name(file_index)));
                 }
                 self.progress = (0.0, 0, 0);
+                self.write_speed = 0;
                 self.joining = false;
                 self.status_line = self.i18n.t("extract.working");
             }
@@ -425,10 +430,12 @@ impl App {
                 fraction,
                 total,
                 part_index,
+                speed_bps,
             } => {
                 if let Some(file_index) = self.file_index(index) {
                     if self.files[file_index].status == Status::Running {
                         self.progress = (fraction, total, part_index);
+                        self.write_speed = speed_bps;
                     }
                 }
             }
@@ -505,6 +512,7 @@ impl App {
                 self.controller = None;
                 self.event_rx = None;
                 self.progress = (0.0, 0, 0);
+                self.write_speed = 0;
                 self.joining = false;
                 self.batch_started = None;
                 self.confirm_close = false;
@@ -901,7 +909,28 @@ impl App {
                             } else {
                                 bar
                             };
-                            ui.add(bar).scroll_to_me(Some(egui::Align::Center));
+                            let speed = (!self.joining && self.write_speed > 0)
+                                .then(|| format_speed(self.write_speed));
+                            ui.horizontal(|ui| {
+                                let spacing = ui.spacing().item_spacing.x;
+                                let reserve = speed.as_ref().map_or(0.0, |text| {
+                                    ui.painter()
+                                        .layout_no_wrap(
+                                            text.clone(),
+                                            egui::TextStyle::Body.resolve(ui.style()),
+                                            egui::Color32::PLACEHOLDER,
+                                        )
+                                        .size()
+                                        .x
+                                        + spacing
+                                });
+                                let width = (ui.available_width() - reserve).max(96.0);
+                                let response = ui.add(bar.desired_width(width));
+                                response.scroll_to_me(Some(egui::Align::Center));
+                                if let Some(text) = speed {
+                                    ui.label(text);
+                                }
+                            });
                         }
                         ui.horizontal(|ui| {
                             ui.label(
@@ -1931,6 +1960,21 @@ fn format_duration(total_secs: u64) -> String {
     format!("{minutes}:{seconds:02}")
 }
 
+/// Formats a byte-per-second rate as `B/s`, `KB/s`, `MB/s` or `GB/s`.
+fn format_speed(bytes_per_sec: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let bytes = bytes_per_sec as f64;
+    if bytes < KIB {
+        format!("{bytes_per_sec} B/s")
+    } else if bytes < KIB * KIB {
+        format!("{:.1} KB/s", bytes / KIB)
+    } else if bytes < KIB * KIB * KIB {
+        format!("{:.1} MB/s", bytes / (KIB * KIB))
+    } else {
+        format!("{:.2} GB/s", bytes / (KIB * KIB * KIB))
+    }
+}
+
 /// Application logo, embedded in the binary for the About window.
 const LOGO_PNG: &[u8] = include_bytes!("../assets/ouch-decompress-gui-256.png");
 
@@ -2006,5 +2050,14 @@ mod tests {
         assert_eq!(format_duration(0), "0:00");
         assert_eq!(format_duration(65), "1:05");
         assert_eq!(format_duration(3600), "60:00");
+    }
+
+    #[test]
+    fn formats_speed_in_binary_units() {
+        assert_eq!(format_speed(0), "0 B/s");
+        assert_eq!(format_speed(999), "999 B/s");
+        assert_eq!(format_speed(1536), "1.5 KB/s");
+        assert_eq!(format_speed(12 * 1024 * 1024 + 300 * 1024), "12.3 MB/s");
+        assert_eq!(format_speed(3 * 1024 * 1024 * 1024), "3.00 GB/s");
     }
 }
