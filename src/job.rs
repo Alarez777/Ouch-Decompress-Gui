@@ -864,15 +864,23 @@ fn process_io(pid: u32) -> Option<(u64, u64)> {
     Some((read, write))
 }
 
-/// Exponential moving average of a transfer rate. `previous` is `None` on the
-/// first sample, so the rate starts at the instantaneous value.
+/// Time constant (in seconds) of the write-speed average. Bigger values make
+/// the displayed speed steadier and less twitchy.
+const SPEED_TAU: f64 = 3.0;
+
+/// Exponential moving average of a transfer rate, weighted by the elapsed time
+/// so it does not depend on how often it is sampled. `previous` is `None` on
+/// the first sample, so the rate starts at the instantaneous value.
 fn smooth_speed(previous: Option<f64>, delta_bytes: u64, secs: f64) -> f64 {
     if secs <= 0.0 {
         return previous.unwrap_or(0.0);
     }
     let instant = delta_bytes as f64 / secs;
     match previous {
-        Some(prev) => 0.3 * instant + 0.7 * prev,
+        Some(prev) => {
+            let alpha = 1.0 - (-secs / SPEED_TAU).exp();
+            alpha * instant + (1.0 - alpha) * prev
+        }
         None => instant,
     }
 }
@@ -947,11 +955,13 @@ fn run_progress_poller(
     ctx: egui::Context,
     stop_rx: Receiver<()>,
 ) {
-    // Write-speed tracking. Reset whenever the child changes (a new attempt
-    // after a wrong password starts a fresh `/proc/<pid>/io` counter).
+    // Write-speed tracking. The rate is averaged over a ~1 s window and only
+    // refreshed that often, so the number stays readable. Reset whenever the
+    // child changes (a new attempt after a wrong password starts a fresh
+    // `/proc/<pid>/io` counter).
     let mut last_pid = 0u32;
-    let mut last_write = 0u64;
-    let mut last_time = std::time::Instant::now();
+    let mut last_speed_write = 0u64;
+    let mut last_speed_time = std::time::Instant::now();
     let mut speed: Option<f64> = None;
     loop {
         let pid = pid_slot.load(Ordering::Relaxed);
@@ -960,14 +970,20 @@ fn run_progress_poller(
                 let now = std::time::Instant::now();
                 if pid != last_pid {
                     last_pid = pid;
-                    last_write = write;
-                    last_time = now;
+                    last_speed_write = write;
+                    last_speed_time = now;
                     speed = None;
                 } else {
-                    let dt = now.duration_since(last_time).as_secs_f64();
-                    speed = Some(smooth_speed(speed, write.saturating_sub(last_write), dt));
-                    last_write = write;
-                    last_time = now;
+                    let window = now.duration_since(last_speed_time).as_secs_f64();
+                    if window >= 1.0 {
+                        speed = Some(smooth_speed(
+                            speed,
+                            write.saturating_sub(last_speed_write),
+                            window,
+                        ));
+                        last_speed_write = write;
+                        last_speed_time = now;
+                    }
                 }
                 let fraction = (read as f64 / total as f64).min(1.0) as f32;
                 let part_index = part_index_for(read, &cumulative);
@@ -1182,9 +1198,12 @@ mod tests {
     fn smooths_write_speed() {
         // First sample is instantaneous.
         assert_eq!(smooth_speed(None, 1_000_000, 1.0), 1_000_000.0);
-        // Later samples blend 30% of the new rate into the average.
+        // Later samples move only partway toward the new rate.
         let smoothed = smooth_speed(Some(1_000_000.0), 2_000_000, 1.0);
-        assert!((smoothed - 1_300_000.0).abs() < 1.0);
+        let alpha = 1.0 - (-1.0_f64 / SPEED_TAU).exp();
+        let expected = alpha * 2_000_000.0 + (1.0 - alpha) * 1_000_000.0;
+        assert!((smoothed - expected).abs() < 1.0);
+        assert!(smoothed > 1_000_000.0 && smoothed < 2_000_000.0);
         // A zero interval keeps the previous value.
         assert_eq!(smooth_speed(Some(42.0), 999, 0.0), 42.0);
     }
