@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-09
+
+### Added
+
+- The progress bar now lives in the row of the file being extracted (just above
+  its name), next to the Cancel button and the elapsed time, and scrolls to stay
+  visible on long lists.
+- A smoothed write-speed readout (e.g. `12.3 MB/s`) to the right of the bar.
+- An estimated time left (ETA) next to the elapsed time, computed from the
+  progress rate.
+
+### Changed
+
+- The "joining parts" phase is highlighted in green and the bar reads "JOINING",
+  so it is clear the archive is not being extracted yet.
+
 ## [0.2.5] - 2026-10-08
 
 ### Added
