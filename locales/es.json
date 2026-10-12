@@ -63,7 +63,7 @@
   "settings.set_default": "Establecer por defecto",
   "settings.set_default.done": "Establecido como app por defecto para los formatos marcados.",
   "settings.desktop.title": "Instalación independiente",
-  "settings.desktop.hint": "Solo para un AppImage independiente. Si lo gestionas con Gear Lever o similar, usa esa herramienta: esto crea la entrada .desktop a mano.",
+  "settings.desktop.hint": "Solo usar en caso de que no uses Gear Lever o similar porque puede crear entradas duplicadas.",
   "settings.desktop.create": "Crear .desktop",
   "settings.desktop.remove": "Eliminar .desktop",
   "settings.desktop.created": "Entrada de escritorio creada.",

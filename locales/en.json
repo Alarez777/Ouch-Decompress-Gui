@@ -63,7 +63,7 @@
   "settings.set_default": "Set as default",
   "settings.set_default.done": "Set as the default app for the checked formats.",
   "settings.desktop.title": "Stand-alone installation",
-  "settings.desktop.hint": "Only for a stand-alone AppImage. If you manage it with Gear Lever or a similar tool, use that instead: this creates the .desktop entry by hand.",
+  "settings.desktop.hint": "Only use this if you do not use Gear Lever or similar, because it can create duplicate entries.",
   "settings.desktop.create": "Create .desktop",
   "settings.desktop.remove": "Remove .desktop",
   "settings.desktop.created": "Desktop entry created.",
