@@ -279,6 +279,26 @@ pub fn set_default(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// True when the app runs from an AppImage: the runtime exports `$APPIMAGE`
+/// with the path to the artifact.
+pub fn running_as_appimage() -> bool {
+    std::env::var("APPIMAGE").is_ok_and(|path| !path.is_empty())
+}
+
+/// Writes the desktop entry, MIME package and icons so the AppImage shows up in
+/// the application menu without relying on an AppImage manager. Returns the
+/// desktop entry path.
+pub fn create_desktop(config: &Config) -> Result<PathBuf> {
+    apply(config)?;
+    Ok(desktop_path())
+}
+
+/// Removes the desktop entry, MIME package and icons written by
+/// [`create_desktop`].
+pub fn remove_desktop() -> Result<()> {
+    remove()
+}
+
 /// Removes the legacy desktop entry, MIME package and icons, then refreshes the
 /// XDG databases.
 fn remove() -> Result<()> {
