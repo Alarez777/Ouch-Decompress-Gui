@@ -1535,6 +1535,32 @@ impl App {
                 }
             }
         }
+
+        if crate::association::running_as_appimage() {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.label(egui::RichText::new(self.i18n.t("settings.desktop.title")).strong());
+            ui.colored_label(
+                egui::Color32::from_rgb(0xc8, 0x8a, 0x00),
+                self.i18n.t("settings.desktop.hint"),
+            );
+            ui.horizontal(|ui| {
+                if ui.button(self.i18n.t("settings.desktop.create")).clicked() {
+                    self.association_status = match crate::association::create_desktop(&self.config)
+                    {
+                        Ok(_) => self.i18n.t("settings.desktop.created"),
+                        Err(err) => format!("{}: {err}", self.i18n.t("common.error")),
+                    };
+                }
+                if ui.button(self.i18n.t("settings.desktop.remove")).clicked() {
+                    self.association_status = match crate::association::remove_desktop() {
+                        Ok(()) => self.i18n.t("settings.desktop.removed"),
+                        Err(err) => format!("{}: {err}", self.i18n.t("common.error")),
+                    };
+                }
+            });
+        }
+
         if !self.association_status.is_empty() {
             ui.label(
                 egui::RichText::new(&self.association_status)
