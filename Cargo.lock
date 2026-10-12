@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "ouch-decompress-gui"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "dirs",
