@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-09
+
+### Added
+
+- When running from an AppImage, the Formats settings tab can create or remove a
+  stand-alone `.desktop` entry (plus MIME package and icons), for installs that
+  do not use an AppImage manager such as Gear Lever.
+
 ## [0.2.6] - 2026-10-09
 
 ### Added
