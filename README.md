@@ -48,16 +48,19 @@ AppImage.
 - Desktop notifications when a batch finishes, including the resulting name
   when it is not obvious from the archive (for example
   `photos.zip -> vacation`), plus an "Open folder" shortcut per file.
-- Dedicated Log window with copy-to-clipboard, and errors shown in a popup.
+- Dedicated Log view with copy-to-clipboard, and errors shown in a popup.
 - Add files with the **Add file** button (native file picker).
-- Settings in their own window, split into **General**, **Formats** and
+- Settings in their own view, split into **General**, **Formats** and
   **Passwords** tabs, with dropdowns for the mutually exclusive options.
   Changes are saved automatically, and **General** has a **Reset options**
   button.
 - Adjustable interface size (percentage), language (System, English, Spanish),
   and theme (System, Light, Dark) with desktop detection.
-- About window with the app and `ouch` versions, a link to the GitHub project,
+- About view with the app and `ouch` versions, a link to the GitHub project,
   and a background check for new releases.
+- Settings, Log and About open on top of the main window and block it until
+  closed; the window grows to fit them and goes back to its previous size
+  afterwards.
 - Small self-contained AppImage (about 7 MB) with instant startup.
 
 ## Supported formats
@@ -74,9 +77,9 @@ implement it on its Wayland backend (only on X11).
 
 A patched `winit`/`egui` fork (the one used by
 [ZapFast](https://github.com/crmne/zapfast)) does implement it, and it was
-tested here. It restored drag & drop, but it made the secondary windows
-(Settings/Log/About) feel unresponsive, so it was left out until the fix lands
-upstream. On X11 sessions drag & drop works.
+tested here. It restored drag & drop, but it made the interface feel
+unresponsive (the app used to draw several windows), so it was left out until
+the fix lands upstream. On X11 sessions drag & drop works.
 
 Until then, use the **Add file** button, or open the archives from your file
 manager (double-click / select several and press Enter).
