@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   some compositors. The window title still shows the active view.
 - Vsync is no longer disabled, since there is only one window now.
 
+### Fixed
+
+- The window now returns to its previous size after closing Settings, Log or
+  About on Wayland, where the previous implementation could not read the window
+  size and fell back to a fixed one.
+
 ## [0.2.7] - 2026-10-09
 
 ### Added

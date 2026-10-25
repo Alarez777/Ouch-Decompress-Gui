@@ -62,14 +62,14 @@ impl View {
     }
 }
 
-/// Window size to restore once the overlay closes.
-struct WindowFit {
-    /// Inner size before opening the overlay, in physical pixels. The UI scale
-    /// can be changed from the settings overlay, so points are not stable.
-    saved: Option<egui::Vec2>,
-    /// Size requested when the overlay opened, in points. If the window is
-    /// larger than this on close, the user resized it by hand and it is kept.
+/// Window resize requested for the active overlay.
+#[derive(Clone, Copy)]
+struct FitRequest {
+    /// Target inner size, in points.
     target: egui::Vec2,
+    /// Requests sent so far. Wayland drops a resize sent before the surface is
+    /// mapped, so it is retried for a few frames.
+    attempts: u8,
 }
 
 /// Per-file processing status.
@@ -139,8 +139,14 @@ pub struct App {
     view: Option<View>,
     /// Which tab is selected in the settings view.
     settings_tab: SettingsTab,
-    /// Size bookkeeping while an overlay is open.
-    window_fit: Option<WindowFit>,
+    /// Inner size to restore when the overlay closes, in physical pixels. The
+    /// UI scale can be changed from the settings overlay, so points are not
+    /// stable. Refreshed every frame while no overlay is open.
+    saved_window_size: Option<egui::Vec2>,
+    /// Resize in progress for the active overlay.
+    fit: Option<FitRequest>,
+    /// Set when the window has to be fitted to the active overlay.
+    fit_needed: bool,
     /// Last applied UI scale (percent), to avoid re-setting it every frame.
     applied_scale: u32,
     /// Background update-check result, when ready.
@@ -253,7 +259,9 @@ impl App {
                 None
             },
             settings_tab: SettingsTab::General,
-            window_fit: None,
+            saved_window_size: None,
+            fit: None,
+            fit_needed: open_settings,
             applied_scale: initial_scale,
             update_status: None,
             update_rx: None,
@@ -806,11 +814,18 @@ impl eframe::App for App {
             self.applied_scale = self.config.ui_scale;
         }
 
-        // `--settings` opens an overlay before the first frame, when the window
-        // size is not known yet.
-        if self.view.is_some() && self.window_fit.is_none() {
-            self.request_window_fit(&ctx);
+        // Remember the size to go back to. `ViewportInfo::inner_rect` cannot be
+        // used: Wayland does not expose the window position, so it is `None`
+        // there. The viewport rect always has the size, in points.
+        let needs_saved = self.view.is_none() || self.saved_window_size.is_none();
+        if let Some(size) = window_size(&ctx).filter(|_| needs_saved) {
+            self.saved_window_size = Some(size * ctx.pixels_per_point());
         }
+
+        if std::mem::take(&mut self.fit_needed) {
+            self.start_window_fit(&ctx);
+        }
+        self.drive_window_fit(&ctx);
 
         self.pump_events();
         self.pump_update();
@@ -1133,7 +1148,8 @@ impl App {
             return;
         }
         self.view = Some(view);
-        self.request_window_fit(ctx);
+        self.fit_needed = true;
+        ctx.request_repaint();
     }
 
     /// Closes the active overlay and restores the window size it had before.
@@ -1145,57 +1161,85 @@ impl App {
             self.bulk_password_open = false;
         }
         self.flush_config(true);
+        self.fit = None;
+        self.fit_needed = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(crate::WINDOW_TITLE.to_owned()));
 
-        if let Some(fit) = self.window_fit.take() {
-            let (current, maximized) = viewport_size(ctx);
-            let resized_by_user = current
-                .is_some_and(|size| size.x > fit.target.x + 1.0 || size.y > fit.target.y + 1.0);
-            if !maximized && !resized_by_user {
-                let size = fit
-                    .saved
-                    .map(|pixels| pixels / ctx.pixels_per_point())
-                    .unwrap_or_else(|| {
-                        egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
-                    });
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            }
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        if !maximized {
+            let size = self
+                .saved_window_size
+                .take()
+                .map(|pixels| pixels / ctx.pixels_per_point())
+                .unwrap_or_else(|| {
+                    egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
+                });
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
         ctx.request_repaint();
     }
 
-    /// Grows the window so the active overlay fits and appends its name to the
-    /// window title.
-    fn request_window_fit(&mut self, ctx: &egui::Context) {
+    /// Appends the active view to the window title and starts growing the
+    /// window so it fits.
+    fn start_window_fit(&mut self, ctx: &egui::Context) {
         let Some(view) = self.view else {
             return;
         };
-        let (inner, maximized) = viewport_size(ctx);
-        let current = inner.unwrap_or_else(|| {
-            egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
-        });
-
-        let wanted = view.window_size();
-        let target = egui::vec2(current.x.max(wanted.x), current.y.max(wanted.y));
-        let saved = if maximized {
-            None
-        } else {
-            self.window_fit
-                .as_ref()
-                .and_then(|fit| fit.saved)
-                .or_else(|| inner.map(|size| size * ctx.pixels_per_point()))
-        };
-
-        let needs_resize = target.x > current.x + 0.5 || target.y > current.y + 0.5;
-        if needs_resize && !maximized {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
-        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
             "{} — {}",
             crate::WINDOW_TITLE,
             self.i18n.t(view.title_key())
         )));
-        self.window_fit = Some(WindowFit { saved, target });
+
+        // eframe creates the window before the UI scale is applied, so until it
+        // reports the real size the window has the default size in native
+        // pixels, which is the default divided by the zoom in points.
+        let current = window_size(ctx).unwrap_or_else(|| {
+            egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
+                / ctx.zoom_factor()
+        });
+        if self.saved_window_size.is_none() {
+            self.saved_window_size = Some(current * ctx.pixels_per_point());
+        }
+
+        let wanted = view.window_size();
+        let target = egui::vec2(current.x.max(wanted.x), current.y.max(wanted.y));
+        if target.x <= current.x + 0.5 && target.y <= current.y + 0.5 {
+            return;
+        }
+        if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        self.fit = Some(FitRequest {
+            target,
+            attempts: 0,
+        });
+        ctx.request_repaint();
+    }
+
+    /// Sends the pending resize, retrying it for a few frames: a request issued
+    /// before the Wayland surface is mapped is dropped by the compositor.
+    fn drive_window_fit(&mut self, ctx: &egui::Context) {
+        let Some(fit) = self.fit else {
+            return;
+        };
+        let Some(current) = window_size(ctx) else {
+            if let Some(fit) = &mut self.fit {
+                fit.attempts += 1;
+            }
+            ctx.request_repaint();
+            return;
+        };
+        let settled = current.x + 0.5 >= fit.target.x && current.y + 0.5 >= fit.target.y;
+        if settled || fit.attempts >= 6 {
+            self.fit = None;
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(fit.target));
+        if let Some(fit) = &mut self.fit {
+            fit.attempts += 1;
+        }
+        ctx.request_repaint();
     }
 
     /// Draws the active overlay, if any. It blocks input to the main window,
@@ -2116,16 +2160,13 @@ fn format_speed(bytes_per_sec: u64) -> String {
 /// Application logo, embedded in the binary for the About view.
 const LOGO_PNG: &[u8] = include_bytes!("../assets/ouch-decompress-gui-256.png");
 
-/// Current inner size of the main viewport in points, and whether it is
-/// maximized.
-fn viewport_size(ctx: &egui::Context) -> (Option<egui::Vec2>, bool) {
-    ctx.input(|input| {
-        let viewport = input.viewport();
-        (
-            viewport.inner_rect.map(|rect| rect.size()),
-            viewport.maximized.unwrap_or(false),
-        )
-    })
+/// Current inner size of the window in points, or `None` while egui still uses
+/// its placeholder rect: eframe reports the real size after the first frame, and
+/// until then egui falls back to a 10000-point rect (rescaled by the zoom).
+fn window_size(ctx: &egui::Context) -> Option<egui::Vec2> {
+    let size = ctx.input(|input| input.raw.screen_rect)?.size();
+    let placeholder = 10_000.0 / ctx.zoom_factor();
+    (size.x < placeholder - 1.0 && size.y < placeholder - 1.0).then_some(size)
 }
 
 /// Decodes the embedded logo into an egui texture, if the PNG is valid.
