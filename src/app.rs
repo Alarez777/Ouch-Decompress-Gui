@@ -1700,7 +1700,7 @@ impl App {
 
         let mut save = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("bulk-password-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("bulk-password-modal")).show(ctx, |ui| {
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(400.0));
             ui.set_max_width(max_width);
@@ -1755,7 +1755,7 @@ impl App {
 
         let mut answer: Option<JobAnswer> = None;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("password-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("password-modal")).show(ctx, |ui| {
             ui.set_min_width(340.0);
             ui.heading(self.i18n.t("password.title"));
             ui.label(
@@ -1818,7 +1818,7 @@ impl App {
 
         let mut extract = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("disabled-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("disabled-modal")).show(ctx, |ui| {
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(380.0));
             ui.set_max_width(max_width);
@@ -1864,7 +1864,7 @@ impl App {
 
         let mut stay = false;
         let mut close = false;
-        egui::Modal::new(egui::Id::new("close-confirm-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("close-confirm-modal")).show(ctx, |ui| {
             ui.set_min_width(360.0);
             ui.heading(self.i18n.t("close_confirm.title"));
             ui.label(self.i18n.t("close_confirm.body"));
@@ -1895,7 +1895,7 @@ impl App {
         let conflicts = prompt.conflicts.clone();
 
         let mut answer: Option<JobAnswer> = None;
-        egui::Modal::new(egui::Id::new("overwrite-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("overwrite-modal")).show(ctx, |ui| {
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(420.0));
             ui.set_max_width(max_width);
@@ -1947,7 +1947,7 @@ impl App {
         };
 
         let mut close = false;
-        egui::Modal::new(egui::Id::new("error-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("error-modal")).show(ctx, |ui| {
             // Never grow wider than the window, or the text gets clipped.
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(420.0));
@@ -1986,7 +1986,7 @@ impl App {
         if !hovering {
             return;
         }
-        egui::Area::new(egui::Id::new("drop-overlay"))
+        egui::Area::new(egui::Id::unique("drop-overlay"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .interactable(false)
