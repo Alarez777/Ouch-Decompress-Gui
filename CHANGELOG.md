@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The window now returns to its previous size after closing Settings, Log or
   About on Wayland, where the previous implementation could not read the window
   size and fell back to a fixed one.
+- The AppImage is now built against glibc 2.35, so it starts on current
+  distributions instead of requiring glibc 2.43.
 
 ## [0.2.7] - 2026-10-09
 

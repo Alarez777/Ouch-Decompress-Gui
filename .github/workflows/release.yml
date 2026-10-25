@@ -15,11 +15,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # An AppImage links against the glibc of the machine that builds it, and
+        # `ubuntu-latest` is now Ubuntu 26.04 (glibc 2.43), which does not run on
+        # current distros. Keep the images and `max_glibc` in sync.
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             arch: x86_64
-          - os: ubuntu-24.04-arm
+            max_glibc: GLIBC_2.35
+          - os: ubuntu-22.04-arm
             arch: aarch64
+            max_glibc: GLIBC_2.35
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +47,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            curl ca-certificates file desktop-file-utils zsync
+            binutils curl ca-certificates file desktop-file-utils zsync
 
       - name: Test
         run: cargo test --release --locked
@@ -54,6 +59,26 @@ jobs:
         run: |
           export VERSION="${VERSION#v}"
           bash packaging/build-appimage.sh "${{ matrix.arch }}"
+
+      - name: Check the AppImage
+        run: |
+          appimage="$(ls dist/*.AppImage)"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
+
+          # Every bundled ELF must run on the oldest glibc we support, not just
+          # the main binary: linuxdeploy copies libraries from the runner too.
+          max_glibc="$(
+            find dist/Ouch-Decompress-Gui.AppDir -type f \
+              \( -path '*/usr/bin/*' -o -name '*.so' -o -name '*.so.*' \) \
+              -exec objdump -T {} + 2>/dev/null \
+              | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          )"
+          echo "highest required: $max_glibc"
+          newest="$(printf '%s\n%s\n' "${{ matrix.max_glibc }}" "$max_glibc" | sort -V | tail -1)"
+          if [ "$newest" != "${{ matrix.max_glibc }}" ]; then
+            echo "::error::the AppImage requires $max_glibc, newer than ${{ matrix.max_glibc }}"
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
