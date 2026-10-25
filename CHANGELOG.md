@@ -11,74 +11,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Settings, Log and About now open on top of the main window and block it until
-  closed. The window grows to fit the view and returns to its previous size
-  afterwards, so the layout stays readable without separate windows. `Esc` or
-  the `×` button closes them.
+- Settings, Log and About now open on top of the main window and block it until closed. The window grows to fit the view and returns to its previous size afterwards, so the layout stays readable without separate windows. `Esc` or the `×` button closes them.
 
 ### Changed
 
 - Updated to egui/eframe 0.37.
-- Removed the separate Settings/Log/About windows, which were unreliable on
-  some compositors. The window title still shows the active view.
+- Removed the separate Settings/Log/About windows, which were unreliable on some compositors. The window title still shows the active view.
 - Vsync is no longer disabled, since there is only one window now.
 
 ### Fixed
 
-- The window now returns to its previous size after closing Settings, Log or
-  About on Wayland, where the previous implementation could not read the window
-  size and fell back to a fixed one.
-- The AppImage is now built against glibc 2.35, so it starts on current
-  distributions instead of requiring glibc 2.43.
+- The window now returns to its previous size after closing Settings, Log or About on Wayland, where the previous implementation could not read the window size and fell back to a fixed one.
+- The AppImage is now built against glibc 2.35, so it starts on current distributions instead of requiring glibc 2.43.
 
 ## [0.2.7] - 2026-10-09
 
 ### Added
 
-- When running from an AppImage, the Formats settings tab can create or remove a
-  stand-alone `.desktop` entry (plus MIME package and icons), for installs that
-  do not use an AppImage manager such as Gear Lever.
+- When running from an AppImage, the Formats settings tab can create or remove a stand-alone `.desktop` entry (plus MIME package and icons), for installs that do not use an AppImage manager such as Gear Lever.
 
 ## [0.2.6] - 2026-10-09
 
 ### Added
 
-- The progress bar now lives in the row of the file being extracted (just above
-  its name), next to the Cancel button and the elapsed time, and scrolls to stay
-  visible on long lists.
+- The progress bar now lives in the row of the file being extracted (just above its name), next to the Cancel button and the elapsed time, and scrolls to stay visible on long lists.
 - A smoothed write-speed readout (e.g. `12.3 MB/s`) to the right of the bar.
-- An estimated time left (ETA) next to the elapsed time, computed from the
-  progress rate.
+- An estimated time left (ETA) next to the elapsed time, computed from the progress rate.
 
 ### Changed
 
-- The "joining parts" phase is highlighted in green and the bar reads "JOINING",
-  so it is clear the archive is not being extracted yet.
+- The "joining parts" phase is highlighted in green and the bar reads "JOINING", so it is clear the archive is not being extracted yet.
 
 ## [0.2.5] - 2026-10-08
 
 ### Added
 
-- Support for numeric split archives (`name.7z.001`, `name.7z.002`, ...): the
-  volumes are joined into a temporary file — with a "Joining parts" phase — and
-  extracted as a single archive.
-- Missing volumes of a numeric split set are detected and reported before
-  extracting anything.
+- Support for numeric split archives (`name.7z.001`, `name.7z.002`, ...): the volumes are joined into a temporary file — with a "Joining parts" phase — and extracted as a single archive.
+- Missing volumes of a numeric split set are detected and reported before extracting anything.
 
 ### Fixed
 
-- The Cancel button now stops the running extraction immediately by
-  terminating the `ouch` process, and also interrupts the concatenation of
-  split volumes and the password prompts.
+- The Cancel button now stops the running extraction immediately by terminating the `ouch` process, and also interrupts the concatenation of split volumes and the password prompts.
 
 ## [0.2.4] - 2026-10-08
 
 ### Added
 
-- Incomplete multi-volume RAR sets are detected — missing first, middle or last
-  volumes — and reported with the missing file names before extracting anything.
-- The Passwords tab shows saved passwords in plain text and can add several at
-  once (one per line; empty and duplicate entries are skipped).
+- Incomplete multi-volume RAR sets are detected — missing first, middle or last volumes — and reported with the missing file names before extracting anything.
+- The Passwords tab shows saved passwords in plain text and can add several at once (one per line; empty and duplicate entries are skipped).
 - Saved passwords can be listed alphabetically (default) or in insertion order.
 
 ### Changed
@@ -91,66 +71,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Support for multi-volume RAR sets (`name.part1.rar`, ...): the whole set is
-  queued as one job, all parts are removed after extraction, and the running
-  entry shows the volume being read (`k/N`).
+- Support for multi-volume RAR sets (`name.part1.rar`, ...): the whole set is queued as one job, all parts are removed after extraction, and the running entry shows the volume being read (`k/N`).
 - Notification policy: Always, Only on failures (default) or Never.
 - The Log window now shows every `ouch` command that runs (passwords masked).
 
 ### Changed
 
 - The password field is focused automatically when its prompt appears.
-- When `ouch list` fails — it can crash on some archives — the plain listing is
-  retried, and if that fails too the password is requested before giving up, so
-  Smart mode keeps working.
-- Finish notifications omit the failure count when there are no failures, and
-  stay quiet when nothing was processed.
+- When `ouch list` fails — it can crash on some archives — the plain listing is retried, and if that fails too the password is requested before giving up, so Smart mode keeps working.
+- Finish notifications omit the failure count when there are no failures, and stay quiet when nothing was processed.
 - Spanish: the Log button and window now read "Log".
 
 ## [0.2.2] - 2026-10-07
 
 ### Changed
 
-- File associations: removed the "Associate" and "Remove associations" buttons.
-  "Set as default" now targets the desktop entry provided by the AppImage
-  manager (e.g. Gear Lever), so no duplicate menu entry is created. A duplicate
-  left by older versions is removed automatically.
+- File associations: removed the "Associate" and "Remove associations" buttons. "Set as default" now targets the desktop entry provided by the AppImage manager (e.g. Gear Lever), so no duplicate menu entry is created. A duplicate left by older versions is removed automatically.
 
 ### Fixed
 
-- The fallback desktop entry now includes its `Icon`, so it no longer shows up
-  without an icon.
+- The fallback desktop entry now includes its `Icon`, so it no longer shows up without an icon.
 
 ## [0.2.1] - 2026-10-07
 
 ### Added
 
-- AppImages now embed `gh-releases-zsync` update information and ship a
-  matching `.zsync` file, so AppImage managers such as Gear Lever can update an
-  installed AppImage automatically from GitHub Releases.
+- AppImages now embed `gh-releases-zsync` update information and ship a matching `.zsync` file, so AppImage managers such as Gear Lever can update an installed AppImage automatically from GitHub Releases.
 
 ## [0.2.0] - 2026-10-07
 
 ### Added
 
 - Per-archive progress bar with elapsed time and a Cancel button.
-- Confirmation when closing the window during extraction: it stops the batch and
-  terminates the running `ouch` process.
+- Confirmation when closing the window during extraction: it stops the batch and terminates the running `ouch` process.
 - Desktop notification when closing aborts an extraction.
 - Application logo and the egui/eframe versions in the About window.
 - `AGENTS.md` with guidance for contributors and AI agents.
 
 ### Changed
 
-- The native file picker runs on a background thread, so the window no longer
-  reports as "not responding"; the button is disabled while it is open and the
-  picker is closed when the app exits.
-- README: independent-project notice, logo next to the title, and emphasis on
-  being written in Rust and lightweight.
+- The native file picker runs on a background thread, so the window no longer reports as "not responding"; the button is disabled while it is open and the picker is closed when the app exits.
+- README: independent-project notice, logo next to the title, and emphasis on being written in Rust and lightweight.
 
 ## [0.1.0] - 2026-10-05
 
 ### Added
 
-- First release: a lightweight, extract-only archive GUI for Linux,
-  driven by the bundled `ouch` binary.
+- First release: a lightweight, extract-only archive GUI for Linux, driven by the bundled `ouch` binary.
