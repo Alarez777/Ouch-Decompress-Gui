@@ -104,14 +104,20 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      # Uses the section of CHANGELOG.md that matches the pushed tag.
+      # Uses the section of CHANGELOG.md that matches the pushed tag. Blank lines
+      # around it are trimmed so the body does not start or end with them.
       - name: Build release notes
         run: |
           version="${GITHUB_REF_NAME#v}"
           awk -v ver="$version" '
             $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
             capture && /^## \[/ { exit }
-            capture { print }
+            capture && NF { started = 1 }
+            started { lines[++n] = $0 }
+            END {
+              while (n > 0 && lines[n] == "") n--
+              for (i = 1; i <= n; i++) print lines[i]
+            }
           ' CHANGELOG.md > release_notes.md
 
           previous="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
