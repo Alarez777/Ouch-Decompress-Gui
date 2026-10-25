@@ -28,6 +28,50 @@ enum SettingsTab {
     Passwords,
 }
 
+/// A secondary view, shown as a modal overlay inside the main window instead of
+/// an independent OS window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Settings,
+    Log,
+    About,
+}
+
+impl View {
+    /// Translation key for the title shown in the overlay header.
+    fn title_key(self) -> &'static str {
+        match self {
+            View::Settings => "settings.title",
+            View::Log => "log.title",
+            View::About => "about.title",
+        }
+    }
+
+    /// Size of the overlay content (header included), in points.
+    fn content_size(self) -> egui::Vec2 {
+        match self {
+            View::Settings => egui::vec2(440.0, 400.0),
+            View::Log => egui::vec2(440.0, 280.0),
+            View::About => egui::vec2(420.0, 410.0),
+        }
+    }
+
+    /// Inner size the window grows to so the overlay fits, in points.
+    fn window_size(self) -> egui::Vec2 {
+        self.content_size() + egui::vec2(64.0, 116.0)
+    }
+}
+
+/// Window resize requested for the active overlay.
+#[derive(Clone, Copy)]
+struct FitRequest {
+    /// Target inner size, in points.
+    target: egui::Vec2,
+    /// Requests sent so far. Wayland drops a resize sent before the surface is
+    /// mapped, so it is retried for a few frames.
+    attempts: u8,
+}
+
 /// Per-file processing status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -89,16 +133,20 @@ pub struct App {
     i18n: I18n,
     ouch: Option<OuchClient>,
     ouch_error: Option<String>,
-    /// Decoded application logo, shown in the About window.
+    /// Decoded application logo, shown in the About view.
     logo: Option<egui::TextureHandle>,
-    /// Whether the independent settings window is open.
-    open_settings: bool,
-    /// Which tab is selected in the settings window.
+    /// Overlay currently shown on top of the main window.
+    view: Option<View>,
+    /// Which tab is selected in the settings view.
     settings_tab: SettingsTab,
-    /// Whether the independent log window is open.
-    open_log: bool,
-    /// Whether the independent about window is open.
-    open_about: bool,
+    /// Inner size to restore when the overlay closes, in physical pixels. The
+    /// UI scale can be changed from the settings overlay, so points are not
+    /// stable. Refreshed every frame while no overlay is open.
+    saved_window_size: Option<egui::Vec2>,
+    /// Resize in progress for the active overlay.
+    fit: Option<FitRequest>,
+    /// Set when the window has to be fitted to the active overlay.
+    fit_needed: bool,
     /// Last applied UI scale (percent), to avoid re-setting it every frame.
     applied_scale: u32,
     /// Background update-check result, when ready.
@@ -205,10 +253,15 @@ impl App {
             ouch,
             ouch_error,
             logo,
-            open_settings,
+            view: if open_settings {
+                Some(View::Settings)
+            } else {
+                None
+            },
             settings_tab: SettingsTab::General,
-            open_log: false,
-            open_about: false,
+            saved_window_size: None,
+            fit: None,
+            fit_needed: open_settings,
             applied_scale: initial_scale,
             update_status: None,
             update_rx: None,
@@ -761,6 +814,19 @@ impl eframe::App for App {
             self.applied_scale = self.config.ui_scale;
         }
 
+        // Remember the size to go back to. `ViewportInfo::inner_rect` cannot be
+        // used: Wayland does not expose the window position, so it is `None`
+        // there. The viewport rect always has the size, in points.
+        let needs_saved = self.view.is_none() || self.saved_window_size.is_none();
+        if let Some(size) = window_size(&ctx).filter(|_| needs_saved) {
+            self.saved_window_size = Some(size * ctx.pixels_per_point());
+        }
+
+        if std::mem::take(&mut self.fit_needed) {
+            self.start_window_fit(&ctx);
+        }
+        self.drive_window_fit(&ctx);
+
         self.pump_events();
         self.pump_update();
         self.pump_file_picker(&ctx);
@@ -802,13 +868,13 @@ impl eframe::App for App {
                     self.start_file_picker(ui.ctx());
                 }
                 if ui.button(self.i18n.t("tab.settings")).clicked() {
-                    self.open_settings = true;
+                    self.open_view(View::Settings, ui.ctx());
                 }
                 if ui.button(self.i18n.t("tab.log")).clicked() {
-                    self.open_log = true;
+                    self.open_view(View::Log, ui.ctx());
                 }
                 if ui.button(self.i18n.t("tab.about")).clicked() {
-                    self.open_about = true;
+                    self.open_view(View::About, ui.ctx());
                     self.maybe_check_update(ui.ctx());
                 }
             });
@@ -817,9 +883,10 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| self.ui_extract(ui));
 
-        self.show_settings_viewport(&ctx);
-        self.show_log_viewport(&ctx);
-        self.show_about_viewport(&ctx);
+        self.ui_active_view(&ctx);
+        if self.view == Some(View::Settings) {
+            self.ui_bulk_password_modal(&ctx);
+        }
 
         // Persist any pending settings change (debounced).
         self.flush_config(false);
@@ -1064,33 +1131,167 @@ impl App {
         }
     }
 
-    fn show_log_viewport(&mut self, ctx: &egui::Context) {
-        if !self.open_log {
+    /// Whether a job or confirmation dialog is open on top of the overlay.
+    fn modal_open(&self) -> bool {
+        self.password_prompt.is_some()
+            || self.overwrite_prompt.is_some()
+            || self.confirm_disabled.is_some()
+            || self.confirm_close
+            || self.error_popup.is_some()
+            || self.bulk_password_open
+    }
+
+    /// Shows an overlay on top of the main window, growing the window if the
+    /// overlay does not fit in the current size.
+    fn open_view(&mut self, view: View, ctx: &egui::Context) {
+        if self.view.is_some() {
             return;
         }
-        let title = format!(
+        self.view = Some(view);
+        self.fit_needed = true;
+        ctx.request_repaint();
+    }
+
+    /// Closes the active overlay and restores the window size it had before.
+    fn close_view(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.view.take() else {
+            return;
+        };
+        if view == View::Settings {
+            self.bulk_password_open = false;
+        }
+        self.flush_config(true);
+        self.fit = None;
+        self.fit_needed = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(crate::WINDOW_TITLE.to_owned()));
+
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        if !maximized {
+            let size = self
+                .saved_window_size
+                .take()
+                .map(|pixels| pixels / ctx.pixels_per_point())
+                .unwrap_or_else(|| {
+                    egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
+                });
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+        ctx.request_repaint();
+    }
+
+    /// Appends the active view to the window title and starts growing the
+    /// window so it fits.
+    fn start_window_fit(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.view else {
+            return;
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
             "{} — {}",
-            self.i18n.t("app.title"),
-            self.i18n.t("log.title")
-        );
-        let builder = egui::ViewportBuilder::default()
-            .with_app_id("ouch-decompress-gui")
-            .with_title(title)
-            .with_inner_size([480.0, 320.0])
-            .with_min_inner_size([480.0, 320.0]);
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("log"),
-            builder,
-            |ui, _class| {
-                if ui.ctx().input(|input| input.viewport().close_requested()) {
-                    self.open_log = false;
-                    self.flush_config(true);
-                    ui.ctx().request_repaint();
-                    return;
+            crate::WINDOW_TITLE,
+            self.i18n.t(view.title_key())
+        )));
+
+        // eframe creates the window before the UI scale is applied, so until it
+        // reports the real size the window has the default size in native
+        // pixels, which is the default divided by the zoom in points.
+        let current = window_size(ctx).unwrap_or_else(|| {
+            egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
+                / ctx.zoom_factor()
+        });
+        if self.saved_window_size.is_none() {
+            self.saved_window_size = Some(current * ctx.pixels_per_point());
+        }
+
+        let wanted = view.window_size();
+        let target = egui::vec2(current.x.max(wanted.x), current.y.max(wanted.y));
+        if target.x <= current.x + 0.5 && target.y <= current.y + 0.5 {
+            return;
+        }
+        if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        self.fit = Some(FitRequest {
+            target,
+            attempts: 0,
+        });
+        ctx.request_repaint();
+    }
+
+    /// Sends the pending resize, retrying it for a few frames: a request issued
+    /// before the Wayland surface is mapped is dropped by the compositor.
+    fn drive_window_fit(&mut self, ctx: &egui::Context) {
+        let Some(fit) = self.fit else {
+            return;
+        };
+        let Some(current) = window_size(ctx) else {
+            if let Some(fit) = &mut self.fit {
+                fit.attempts += 1;
+            }
+            ctx.request_repaint();
+            return;
+        };
+        let settled = current.x + 0.5 >= fit.target.x && current.y + 0.5 >= fit.target.y;
+        if settled || fit.attempts >= 6 {
+            self.fit = None;
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(fit.target));
+        if let Some(fit) = &mut self.fit {
+            fit.attempts += 1;
+        }
+        ctx.request_repaint();
+    }
+
+    /// Draws the active overlay, if any. It blocks input to the main window,
+    /// like the old independent windows did.
+    fn ui_active_view(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.view else {
+            return;
+        };
+
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape))
+            && !ctx.any_popup_open()
+            && !self.modal_open()
+        {
+            self.close_view(ctx);
+            return;
+        }
+
+        let size = view.content_size();
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique(("view", view.title_key()))).show(ctx, |ui| {
+            ui.set_min_width(size.x);
+            ui.set_max_width(size.x);
+            ui.set_min_height(size.y);
+            ui.set_max_height(size.y);
+            ui.horizontal(|ui| {
+                ui.heading(self.i18n.t(view.title_key()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("×")
+                        .on_hover_text(self.i18n.t("common.close"))
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+            ui.separator();
+            ui.add_space(4.0);
+            match view {
+                View::Settings => self.ui_settings(ui),
+                View::Log => self.ui_log(ui),
+                View::About => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("about")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.ui_about(ui));
                 }
-                egui::CentralPanel::default().show(ui, |ui| self.ui_log(ui));
-            },
-        );
+            }
+        });
+        if close {
+            self.close_view(ctx);
+        }
     }
 
     fn ui_log(&mut self, ui: &mut egui::Ui) {
@@ -1103,9 +1304,7 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(self.i18n.t("common.close")).clicked() {
-                    self.open_log = false;
-                    self.flush_config(true);
-                    ui.ctx().request_repaint();
+                    self.close_view(ui.ctx());
                 }
             });
         });
@@ -1127,35 +1326,6 @@ impl App {
                     }
                 });
         }
-    }
-
-    fn show_about_viewport(&mut self, ctx: &egui::Context) {
-        if !self.open_about {
-            return;
-        }
-        let title = format!(
-            "{} — {}",
-            self.i18n.t("app.title"),
-            self.i18n.t("about.title")
-        );
-        let builder = egui::ViewportBuilder::default()
-            .with_app_id("ouch-decompress-gui")
-            .with_title(title)
-            .with_inner_size([420.0, 470.0])
-            .with_min_inner_size([400.0, 430.0]);
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("about"),
-            builder,
-            |ui, _class| {
-                if ui.ctx().input(|input| input.viewport().close_requested()) {
-                    self.open_about = false;
-                    self.flush_config(true);
-                    ui.ctx().request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ui, |ui| self.ui_about(ui));
-            },
-        );
     }
 
     fn ui_about(&mut self, ui: &mut egui::Ui) {
@@ -1239,42 +1409,9 @@ impl App {
         ui.add_space(10.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button(self.i18n.t("common.close")).clicked() {
-                self.open_about = false;
-                self.flush_config(true);
-                ui.ctx().request_repaint();
+                self.close_view(ui.ctx());
             }
         });
-    }
-
-    fn show_settings_viewport(&mut self, ctx: &egui::Context) {
-        if !self.open_settings {
-            return;
-        }
-        let title = format!(
-            "{} — {}",
-            self.i18n.t("app.title"),
-            self.i18n.t("settings.title")
-        );
-        let builder = egui::ViewportBuilder::default()
-            .with_app_id("ouch-decompress-gui")
-            .with_title(title)
-            .with_inner_size([480.0, 420.0])
-            .with_min_inner_size([480.0, 420.0]);
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("settings"),
-            builder,
-            |ui, _class| {
-                if ui.ctx().input(|input| input.viewport().close_requested()) {
-                    self.open_settings = false;
-                    self.bulk_password_open = false;
-                    self.flush_config(true);
-                    ui.ctx().request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ui, |ui| self.ui_settings(ui));
-                self.ui_bulk_password_modal(ui.ctx());
-            },
-        );
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
@@ -1700,7 +1837,7 @@ impl App {
 
         let mut save = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("bulk-password-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("bulk-password-modal")).show(ctx, |ui| {
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(400.0));
             ui.set_max_width(max_width);
@@ -1755,7 +1892,7 @@ impl App {
 
         let mut answer: Option<JobAnswer> = None;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("password-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("password-modal")).show(ctx, |ui| {
             ui.set_min_width(340.0);
             ui.heading(self.i18n.t("password.title"));
             ui.label(
@@ -1818,7 +1955,7 @@ impl App {
 
         let mut extract = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("disabled-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("disabled-modal")).show(ctx, |ui| {
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(380.0));
             ui.set_max_width(max_width);
@@ -1864,7 +2001,7 @@ impl App {
 
         let mut stay = false;
         let mut close = false;
-        egui::Modal::new(egui::Id::new("close-confirm-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("close-confirm-modal")).show(ctx, |ui| {
             ui.set_min_width(360.0);
             ui.heading(self.i18n.t("close_confirm.title"));
             ui.label(self.i18n.t("close_confirm.body"));
@@ -1895,7 +2032,7 @@ impl App {
         let conflicts = prompt.conflicts.clone();
 
         let mut answer: Option<JobAnswer> = None;
-        egui::Modal::new(egui::Id::new("overwrite-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("overwrite-modal")).show(ctx, |ui| {
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(420.0));
             ui.set_max_width(max_width);
@@ -1947,7 +2084,7 @@ impl App {
         };
 
         let mut close = false;
-        egui::Modal::new(egui::Id::new("error-modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("error-modal")).show(ctx, |ui| {
             // Never grow wider than the window, or the text gets clipped.
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(420.0));
@@ -1986,7 +2123,7 @@ impl App {
         if !hovering {
             return;
         }
-        egui::Area::new(egui::Id::new("drop-overlay"))
+        egui::Area::new(egui::Id::unique("drop-overlay"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .interactable(false)
@@ -2020,8 +2157,17 @@ fn format_speed(bytes_per_sec: u64) -> String {
     }
 }
 
-/// Application logo, embedded in the binary for the About window.
+/// Application logo, embedded in the binary for the About view.
 const LOGO_PNG: &[u8] = include_bytes!("../assets/ouch-decompress-gui-256.png");
+
+/// Current inner size of the window in points, or `None` while egui still uses
+/// its placeholder rect: eframe reports the real size after the first frame, and
+/// until then egui falls back to a 10000-point rect (rescaled by the zoom).
+fn window_size(ctx: &egui::Context) -> Option<egui::Vec2> {
+    let size = ctx.input(|input| input.raw.screen_rect)?.size();
+    let placeholder = 10_000.0 / ctx.zoom_factor();
+    (size.x < placeholder - 1.0 && size.y < placeholder - 1.0).then_some(size)
+}
 
 /// Decodes the embedded logo into an egui texture, if the PNG is valid.
 fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {

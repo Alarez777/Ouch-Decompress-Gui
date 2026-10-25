@@ -26,8 +26,9 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
 ## Architecture
 
 - `src/main.rs` — CLI arguments, window creation, help/version.
-- `src/app.rs` — UI state and rendering (main window plus separate
-  Settings/Log/About viewports).
+- `src/app.rs` — UI state and rendering; Settings/Log/About are modal overlays
+  inside the main window, which grows to fit them and restores its size when
+  they close.
 - `src/job.rs` — background batch extraction worker; talks to the UI only
   through channels.
 - `src/ouch.rs` — the single place that builds `ouch` commands and parses them.
@@ -45,11 +46,12 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
 - Do not add comments unless they explain a non-obvious *why*.
 - Use official crates.io crates only; never add `[patch]` or git dependencies.
 - Keep `locales/en.json` and `locales/es.json` key-aligned.
-- Do not re-enable `vsync` in `NativeOptions`: it makes the secondary windows
-  (Settings/Log/About) laggy.
+- Do not re-introduce independent OS windows for Settings/Log/About: they are
+  modal overlays inside the main window, and the window size is fitted and
+  restored around them (`request_window_fit`/`close_view` in `src/app.rs`).
 - Drag & drop only works on X11; upstream `winit` does not implement it on
   Wayland. Do not reintroduce the patched `winit`/`egui` fork until it lands
-  upstream, because it makes the secondary windows unresponsive.
+  upstream, because it makes the interface unresponsive.
 - The bundled `ouch` is a static-PIE binary, so it must be copied into the
   AppDir *after* `linuxdeploy` runs (see `packaging/build-appimage.sh`).
 - Extraction progress is *estimated*: `ouch` exposes no progress, so the worker

@@ -20,6 +20,14 @@ mod update;
 
 use std::path::PathBuf;
 
+/// Title of the single OS window. It briefly gets the name of the active
+/// overlay appended to it, to keep the old "separate window" cue.
+pub const WINDOW_TITLE: &str = "Ouch Decompress";
+
+/// Default inner size of the main window, in points. It is also restored when
+/// an overlay closes if the size before opening it is unknown.
+pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [580.0, 300.0];
+
 fn main() -> eframe::Result<()> {
     let options = parse_args();
 
@@ -34,9 +42,9 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_app_id("ouch-decompress-gui")
-        .with_inner_size([580.0, 300.0])
-        .with_min_inner_size([580.0, 300.0])
-        .with_title("Ouch Decompress");
+        .with_inner_size(DEFAULT_WINDOW_SIZE)
+        .with_min_inner_size(DEFAULT_WINDOW_SIZE)
+        .with_title(WINDOW_TITLE);
     if let Ok(icon) =
         eframe::icon_data::from_png_bytes(include_bytes!("../assets/ouch-decompress-gui-256.png"))
     {
@@ -45,18 +53,11 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport,
-        // Disable vsync: with separate (immediate-viewport) windows, waiting for
-        // the display refresh on two surfaces caused the settings/log windows to
-        // stall and feel unresponsive. Renders are composited by the compositor.
-        glow_options: eframe::egui_glow::GlowConfiguration {
-            vsync: false,
-            ..Default::default()
-        },
         ..Default::default()
     };
 
     eframe::run_native(
-        "Ouch Decompress",
+        WINDOW_TITLE,
         native_options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, options.files, options.settings)))),
     )
@@ -104,7 +105,7 @@ fn print_help() {
          ARGUMENTS:\n\
          \x20   <ARCHIVE>...   Archives to extract immediately\n\n\
          OPTIONS:\n\
-         \x20   -s, --settings   Open the settings tab\n\
+         \x20   -s, --settings   Open the settings view\n\
          \x20   -h, --help       Print help\n\
          \x20   -V, --version    Print version",
         name = env!("CARGO_PKG_NAME"),
