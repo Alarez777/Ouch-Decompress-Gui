@@ -20,12 +20,59 @@ use crate::theme::{self, ThemeChoice};
 /// being joined and the archive is not being extracted yet.
 const JOINING_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 
+/// Failures and failed entries, so they stand out from the rest of the text.
+const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x30, 0x25);
+
 /// Tabs inside the settings window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
     Formats,
     Passwords,
+}
+
+/// Whether the status line reports a failure.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    #[default]
+    Info,
+    Error,
+}
+
+/// One-line status under the toolbar. Keeping the kind separate from the text
+/// lets the UI paint the "Error" prefix without hardcoding it in the message.
+#[derive(Debug, Default, Clone)]
+struct StatusLine {
+    text: String,
+    kind: StatusKind,
+}
+
+impl StatusLine {
+    /// A neutral message.
+    fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Info,
+        }
+    }
+
+    /// A failure; the UI prefixes it with a red "Error".
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Error,
+        }
+    }
+
+    /// Drops the message and resets the kind to neutral.
+    fn clear(&mut self) {
+        self.text.clear();
+        self.kind = StatusKind::Info;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
 }
 
 /// A secondary view, shown as a modal overlay inside the main window instead of
@@ -98,7 +145,7 @@ impl Status {
             Status::Pending => egui::Color32::GRAY,
             Status::Running => egui::Color32::from_rgb(0x2f, 0x80, 0xed),
             Status::Done => egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
-            Status::Failed => egui::Color32::from_rgb(0xd9, 0x30, 0x25),
+            Status::Failed => ERROR_COLOR,
             Status::Skipped => egui::Color32::from_rgb(0xc8, 0x8a, 0x00),
         }
     }
@@ -189,7 +236,7 @@ pub struct App {
     scale_dragging: bool,
     files: Vec<FileEntry>,
     log: Vec<String>,
-    status_line: String,
+    status_line: StatusLine,
     running: bool,
     controller: Option<JobController>,
     event_rx: Option<Receiver<JobEvent>>,
@@ -331,7 +378,7 @@ impl App {
             scale_dragging: false,
             files: Vec::new(),
             log: Vec::new(),
-            status_line: String::new(),
+            status_line: StatusLine::default(),
             running: false,
             controller: None,
             event_rx: None,
@@ -368,7 +415,7 @@ impl App {
 
         // A corrupt config must be visible: stderr goes nowhere in an AppImage.
         if let Some(warning) = config_warning {
-            app.status_line = format!("{}: {warning}", app.i18n.t("common.error"));
+            app.status_line = StatusLine::error(warning.clone());
             app.push_log(warning);
         }
 
@@ -433,7 +480,7 @@ impl App {
             return;
         }
         let Some(ouch) = self.ouch.clone() else {
-            self.status_line = self.i18n.t("ouch.not_found");
+            self.status_line = StatusLine::info(self.i18n.t("ouch.not_found"));
             return;
         };
 
@@ -602,7 +649,7 @@ impl App {
                 self.write_speed = 0;
                 self.eta_secs = 0;
                 self.joining = false;
-                self.status_line = self.i18n.t("extract.working");
+                self.status_line = StatusLine::info(self.i18n.t("extract.working"));
             }
             JobEvent::Log { index, line } => {
                 let _ = index;
@@ -729,7 +776,7 @@ impl App {
                 self.joining = false;
                 self.batch_started = None;
                 self.confirm_close = false;
-                self.status_line = self.i18n.t("extract.all_done");
+                self.status_line = StatusLine::info(self.i18n.t("extract.all_done"));
 
                 let done = self
                     .files
@@ -874,7 +921,7 @@ impl App {
         if let Err(err) = self.config.save() {
             // Keep the change pending so a later flush can retry the write.
             self.config_dirty = true;
-            self.status_line = format!("{}: {err}", self.i18n.t("common.error"));
+            self.status_line = StatusLine::error(err.to_string());
         }
     }
 
@@ -1099,12 +1146,26 @@ impl App {
     fn ui_extract(&mut self, ui: &mut egui::Ui) {
         if self.ouch.is_none() {
             let error = self.ouch_error.clone().unwrap_or_default();
-            ui.colored_label(egui::Color32::from_rgb(0xd9, 0x30, 0x25), error);
+            ui.colored_label(ERROR_COLOR, error);
             ui.label(self.i18n.t("ouch.not_found_hint"));
         }
 
         if !self.running && !self.status_line.is_empty() {
-            ui.label(self.status_line.clone());
+            match self.status_line.kind {
+                StatusKind::Info => {
+                    ui.label(self.status_line.text.clone());
+                }
+                StatusKind::Error => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(self.i18n.t("common.error"))
+                                .strong()
+                                .color(ERROR_COLOR),
+                        );
+                        ui.label(self.status_line.text.clone());
+                    });
+                }
+            }
         }
 
         if self.files.is_empty() {
@@ -1227,7 +1288,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new(&file.message)
                                         .small()
-                                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
+                                        .color(ERROR_COLOR),
                                 );
                             }
                             ui.with_layout(
@@ -1686,7 +1747,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(self.i18n.t("destination.not_set"))
                         .small()
-                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
+                        .color(ERROR_COLOR),
                 );
             }
         }
@@ -2124,11 +2185,7 @@ impl App {
             );
             // Only shown after a submitted password failed.
             if let Some(error) = &error {
-                ui.label(
-                    egui::RichText::new(error)
-                        .small()
-                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
-                );
+                ui.label(egui::RichText::new(error).small().color(ERROR_COLOR));
             }
             ui.add_space(4.0);
             ui.label(self.i18n.t("password.prompt"));
@@ -2212,7 +2269,7 @@ impl App {
             self.start_batch(&ctx);
         } else if cancel {
             self.confirm_disabled = None;
-            self.status_line = self.i18n.t("confirm_disabled.cancelled");
+            self.status_line = StatusLine::info(self.i18n.t("confirm_disabled.cancelled"));
         }
     }
 
@@ -2278,11 +2335,7 @@ impl App {
             };
             ui.label(body);
             if let Some(error) = &error {
-                ui.label(
-                    egui::RichText::new(error)
-                        .small()
-                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
-                );
+                ui.label(egui::RichText::new(error).small().color(ERROR_COLOR));
             }
             ui.add_space(4.0);
             ui.label(self.i18n.t("destination.folder"));
@@ -2408,10 +2461,7 @@ impl App {
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(420.0));
             ui.set_max_width(max_width);
-            ui.heading(
-                egui::RichText::new(self.i18n.t("common.error"))
-                    .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
-            );
+            ui.heading(egui::RichText::new(self.i18n.t("common.error")).color(ERROR_COLOR));
             egui::ScrollArea::vertical()
                 .id_salt("error-scroll")
                 .max_height(260.0)
