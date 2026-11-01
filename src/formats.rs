@@ -184,6 +184,31 @@ pub fn is_archive_path(path: &Path) -> bool {
     formats_in_path(path).iter().any(|format| format.is_archive)
 }
 
+/// How a path extracts: a container may hold several roots, a stream cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveKind {
+    /// Container format (`tar`, `zip`, `7z`, ...), which may nest a folder.
+    Archive,
+    /// Single compressed file (`gz`, `xz`, `zst`, ...) extracted in place.
+    Stream,
+}
+
+impl ArchiveKind {
+    /// Classifies `path` by its whole extension chain.
+    pub fn of_path(path: &Path) -> Self {
+        if is_archive_path(path) {
+            Self::Archive
+        } else {
+            Self::Stream
+        }
+    }
+
+    /// True for container formats.
+    pub fn is_archive(self) -> bool {
+        self == Self::Archive
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

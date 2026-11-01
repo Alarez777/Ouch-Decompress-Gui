@@ -82,8 +82,8 @@ impl OuchClient {
         candidates
     }
 
-    /// Path of the resolved binary.
-    #[allow(dead_code)] // handy for diagnostics and future "open in terminal"
+    /// Path of the resolved binary, for the tests that run `ouch` directly.
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -264,6 +264,7 @@ fn stderr_or_stdout(stderr: &[u8], stdout: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::ArchiveKind;
     use crate::modes::{choose_target, roots_from_listing, DecompressMode, Target};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -316,7 +317,7 @@ mod tests {
         let roots = roots_from_listing(&listing);
         assert!(roots.len() > 1, "expected multiple roots, got {roots:?}");
         assert_eq!(
-            choose_target(DecompressMode::Smart, true, &roots),
+            choose_target(DecompressMode::Smart, ArchiveKind::Archive, &roots),
             Target::Folder
         );
 
@@ -345,7 +346,7 @@ mod tests {
         let roots = roots_from_listing(&listing);
         assert_eq!(roots.len(), 1, "expected a single root, got {roots:?}");
         assert_eq!(
-            choose_target(DecompressMode::Smart, true, &roots),
+            choose_target(DecompressMode::Smart, ArchiveKind::Archive, &roots),
             Target::Here
         );
 

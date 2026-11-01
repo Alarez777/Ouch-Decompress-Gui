@@ -58,6 +58,41 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
   polls the child's `/proc/<pid>/io` `rchar` and divides it by the archive size
   (`src/job.rs`). Keep it best-effort and Linux-only.
 
+## Rust quality bar
+
+The Rust here follows the `rust-best-practices` skill from BeautifulRust
+(https://github.com/morganlinton/BeautifulRust). Load it before writing,
+refactoring or explaining Rust, `rust-review` before reviewing a file, module
+or diff (it produces a prioritized `Must fix` / `Should fix` / `Consider`
+report with `file:line` and the rule each finding breaks), and `rust-port` only
+when translating code from another language.
+
+- This is **application code**: concrete types, `anyhow` with `.context(...)`,
+  no speculative generics or trait abstractions.
+- No `unwrap()` outside `#[cfg(test)]`; use `?` or `expect("why it cannot
+  fail")`.
+- Suppressions must explain themselves and expire when the lint stops firing:
+  `#[expect(clippy::lint, reason = "...")]`, never a bare `#[allow]`.
+- Every `unsafe` block carries a `// SAFETY:` comment saying why the invariants
+  hold (the `libc` calls in `src/multivolume.rs` and `src/system.rs`).
+- No `#![deny(warnings)]` in source; warnings are enforced with
+  `cargo clippy --all-targets -- -D warnings` instead.
+- No `bool` parameters in signatures shared across modules: use a two-variant
+  enum (`ArchiveKind`, `PromptScope`, `Flush`, `Startup`) or two functions.
+- Public items get `///` docs with a one-line summary, plus `# Errors` /
+  `# Panics` when they apply. Prefer `format!` over `+`.
+
+### Lints
+
+The BeautifulRust lint set lives in `Cargo.toml` (`[lints.rust]` and
+`[lints.clippy]`) with `clippy.toml` next to it (`max-fn-params-bools = 0`, and
+unwrap/expect/print allowed inside tests). It is adapted to a binary crate:
+`unreachable_pub` is omitted because every `pub` item in a binary is
+unreachable from outside, and the warning groups (`all`, `pedantic`) are
+deliberately not enabled yet. Adding a `#[allow]` that the `[lints]` table
+already covers, or a numeric `as` cast in UI code, needs a `#[expect]` with a
+reason.
+
 ## Branching and releases
 
 - `develop` is the integration branch; `main` holds released code.

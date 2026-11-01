@@ -36,6 +36,55 @@ winit = { version = "0.30.13", default-features = false, features = [
     "wayland-dlopen",
 ] }
 
+# Lints from the BeautifulRust guide (https://github.com/morganlinton/BeautifulRust),
+# adapted to a binary crate. Warning groups (`all`, `pedantic`) are added later;
+# `unreachable_pub` is omitted because every `pub` item in a binary is
+# unreachable from outside, so it would flag the whole crate.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "allow"
+panic_in_result_fn = "warn"
+missing_assert_message = "warn"
+
+# Suppressions must explain themselves and expire when no longer needed.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# Unsafe must be justified.
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# API shape.
+fn_params_excessive_bools = "warn"
+struct_excessive_bools = "warn"
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+
+# Evolution.
+exhaustive_enums = "warn"
+
+# Idioms.
+string_add = "warn"
+wildcard_imports = "warn"
+
+# Debugging leftovers.
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Casts that silently lose information.
+as_conversions = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -146,6 +146,10 @@ enum DirPickerTarget {
 }
 
 /// Root application.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent view flags; they become sub-states only when the UI grows"
+)]
 pub struct App {
     config: Config,
     i18n: I18n,
@@ -250,18 +254,38 @@ pub struct App {
     batch_started: Option<std::time::Instant>,
 }
 
+/// What the app shows once the window is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Startup {
+    /// Main view; extract the files passed on the command line, if any.
+    Extract,
+    /// Open the Settings overlay instead of extracting.
+    Settings,
+}
+
+/// When `flush_config` should write, since slider drags change many times a
+/// second and must not hit the disk each frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flush {
+    /// Skip the write when the last one happened less than 400 ms ago.
+    Debounced,
+    /// Write now, e.g. when the settings view or the window closes.
+    Forced,
+}
+
 impl App {
     /// Builds the app. When `initial_files` is non-empty the batch starts
     /// immediately (the double-click / "open with" flow).
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial_files: Vec<PathBuf>,
-        open_settings: bool,
+        startup: Startup,
     ) -> Self {
         let config = Config::load();
         let i18n = I18n::new(config.language);
         theme::apply(&cc.egui_ctx, config.theme);
-        cc.egui_ctx.set_zoom_factor(config.ui_scale as f32 / 100.0);
+        cc.egui_ctx
+            .set_zoom_factor(ui_scale::zoom_factor(config.ui_scale));
 
         let (ouch, ouch_error) = match OuchClient::discover() {
             Ok(client) => (Some(client), None),
@@ -274,7 +298,7 @@ impl App {
         // AppImage manager already provides one.
         crate::association::remove_legacy_if_redundant();
 
-        let auto_close_on_success = !initial_files.is_empty() && !open_settings;
+        let auto_close_on_success = !initial_files.is_empty() && startup == Startup::Extract;
         let initial_scale = config.ui_scale;
         let destination_dir_input = config
             .destination_dir
@@ -288,7 +312,7 @@ impl App {
             ouch,
             ouch_error,
             logo,
-            view: if open_settings {
+            view: if startup == Startup::Settings {
                 Some(View::Settings)
             } else {
                 None
@@ -296,7 +320,7 @@ impl App {
             settings_tab: SettingsTab::General,
             saved_window_size: None,
             fit: None,
-            fit_needed: open_settings,
+            fit_needed: startup == Startup::Settings,
             applied_scale: initial_scale,
             update_status: None,
             update_rx: None,
@@ -484,7 +508,7 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        let pid_slot = self.picker_pid.clone();
+        let pid_slot = Arc::clone(&self.picker_pid);
         thread::spawn(move || {
             let files = crate::system::pick_files(&pid_slot);
             if tx.send(files).is_ok() {
@@ -517,7 +541,7 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        let pid_slot = self.picker_pid.clone();
+        let pid_slot = Arc::clone(&self.picker_pid);
         thread::spawn(move || {
             let dir = crate::system::pick_directory(&pid_slot);
             if tx.send(dir).is_ok() {
@@ -827,8 +851,8 @@ impl App {
     }
 
     /// Writes the config if there are pending changes and enough time passed
-    /// since the last write (or `force` is set).
-    fn flush_config(&mut self, force: bool) {
+    /// since the last write (or the flush is forced).
+    fn flush_config(&mut self, urgency: Flush) {
         if !self.config_dirty {
             return;
         }
@@ -836,7 +860,7 @@ impl App {
         let due = self
             .last_config_save
             .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_millis(400));
-        if !force && !due {
+        if urgency == Flush::Debounced && !due {
             return;
         }
         self.last_config_save = Some(now);
@@ -940,7 +964,7 @@ impl eframe::App for App {
         // expensive (font atlas + relayout), so while the slider is dragged we
         // wait until it is released.
         if !self.scale_dragging && self.applied_scale != self.config.ui_scale {
-            ctx.set_zoom_factor(self.config.ui_scale as f32 / 100.0);
+            ctx.set_zoom_factor(ui_scale::zoom_factor(self.config.ui_scale));
             self.applied_scale = self.config.ui_scale;
         }
 
@@ -972,7 +996,7 @@ impl eframe::App for App {
 
         // A confirmed close always wins, so it never gets intercepted again.
         if self.close_requested {
-            self.flush_config(true);
+            self.flush_config(Flush::Forced);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -984,7 +1008,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.confirm_close = true;
             } else {
-                self.flush_config(true);
+                self.flush_config(Flush::Forced);
             }
         }
 
@@ -1020,7 +1044,7 @@ impl eframe::App for App {
         }
 
         // Persist any pending settings change (debounced).
-        self.flush_config(false);
+        self.flush_config(Flush::Debounced);
         if self.config_dirty {
             ctx.request_repaint_after(std::time::Duration::from_millis(400));
         }
@@ -1293,7 +1317,7 @@ impl App {
         if view == View::Settings {
             self.bulk_password_open = false;
         }
-        self.flush_config(true);
+        self.flush_config(Flush::Forced);
         self.fit = None;
         self.fit_needed = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(crate::WINDOW_TITLE.to_owned()));
@@ -1773,7 +1797,7 @@ impl App {
 
         ui.add_space(12.0);
         ui.label(egui::RichText::new(self.i18n.t("settings.ui_scale")).strong());
-        let mut scale = self.config.ui_scale as f32;
+        let mut scale = ui_scale::percent_value(self.config.ui_scale);
         let response = ui.add(
             egui::Slider::new(&mut scale, 75.0..=200.0)
                 .suffix("%")
@@ -1781,7 +1805,7 @@ impl App {
         );
         self.scale_dragging = response.dragged();
         if response.changed() {
-            self.config.ui_scale = scale.round() as u32;
+            self.config.ui_scale = ui_scale::from_percent_value(scale);
             self.persist();
         }
 
@@ -2424,6 +2448,33 @@ impl App {
     }
 }
 
+/// Numeric conversions for the UI scale.
+///
+/// The config stores a percentage as `u32` and egui works in `f32`, so `as` is
+/// the only bridge available. Keeping it here documents why it is safe.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the scale is clamped to 75..=200, so every conversion is exact"
+)]
+mod ui_scale {
+    /// Slider value (`75.0..=200.0`) for a stored percentage.
+    pub fn percent_value(percent: u32) -> f32 {
+        percent as f32
+    }
+
+    /// egui zoom factor (`1.0` = 100 %) for a stored percentage.
+    pub fn zoom_factor(percent: u32) -> f32 {
+        percent as f32 / 100.0
+    }
+
+    /// Stored percentage for a slider value.
+    pub fn from_percent_value(value: f32) -> u32 {
+        value.round() as u32
+    }
+}
+
 /// Formats a number of seconds as `M:SS`.
 fn format_duration(total_secs: u64) -> String {
     let minutes = total_secs / 60;
@@ -2432,6 +2483,10 @@ fn format_duration(total_secs: u64) -> String {
 }
 
 /// Formats a byte-per-second rate as `B/s`, `KB/s`, `MB/s` or `GB/s`.
+#[expect(
+    clippy::as_conversions,
+    reason = "display-only rate; `f64::from` does not cover u64"
+)]
 fn format_speed(bytes_per_sec: u64) -> String {
     const KIB: f64 = 1024.0;
     let bytes = bytes_per_sec as f64;
@@ -2462,7 +2517,10 @@ fn window_size(ctx: &egui::Context) -> Option<egui::Vec2> {
 fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let image = image::load_from_memory_with_format(LOGO_PNG, image::ImageFormat::Png).ok()?;
     let rgba = image.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
+    let size = [
+        usize::try_from(rgba.width()).expect("image width fits in usize"),
+        usize::try_from(rgba.height()).expect("image height fits in usize"),
+    ];
     let pixels = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
     Some(ctx.load_texture("app-logo", pixels, egui::TextureOptions::LINEAR))
 }

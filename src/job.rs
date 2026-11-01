@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
-use crate::formats;
+use crate::formats::{self, ArchiveKind};
 use crate::i18n::I18n;
 use crate::modes::{self, DecompressMode, DestinationMode, Target};
 use crate::multivolume;
@@ -132,8 +132,8 @@ pub fn spawn(
 
     let controller = JobController {
         answer_tx,
-        cancel_all: cancel_all.clone(),
-        current_pid: current_pid.clone(),
+        cancel_all: Arc::clone(&cancel_all),
+        current_pid: Arc::clone(&current_pid),
     };
 
     thread::spawn(move || {
@@ -153,7 +153,10 @@ pub fn spawn(
     (controller, event_rx)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the worker entry point takes the whole batch context"
+)]
 fn run(
     ouch: OuchClient,
     archives: Vec<PathBuf>,
@@ -197,7 +200,10 @@ fn run(
     send(&event_tx, &ctx, JobEvent::AllDone);
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one archive in, the whole batch context out; grouping it would hide the flow"
+)]
 fn process_one(
     ouch: &OuchClient,
     archive: &Path,
@@ -238,8 +244,13 @@ fn process_one(
     // so it works even for a single huge file (where counting entries does
     // not). The guard stops the poller when this function returns. `current_pid`
     // is shared with the UI so it can kill the child if the user closes.
-    let _progress =
-        ProgressPoller::spawn(index, &cleanup_parts, current_pid.clone(), event_tx, ctx);
+    let _progress = ProgressPoller::spawn(
+        index,
+        &cleanup_parts,
+        Arc::clone(current_pid),
+        event_tx,
+        ctx,
+    );
 
     // Prepare the file `ouch` should read. For a raw split (`name.7z.001`) this
     // concatenates the volumes into a temporary (see `multivolume`); other
@@ -263,11 +274,7 @@ fn process_one(
         split_kind,
         cancel_all,
         |copied, total| {
-            let fraction = if total == 0 {
-                0.0
-            } else {
-                copied as f32 / total as f32
-            };
+            let fraction = progress_math::fraction_of(copied, total);
             let _ = send(
                 event_tx,
                 ctx,
@@ -319,7 +326,7 @@ fn process_one(
         format!("destination: {}", workdir.display()),
     );
 
-    let is_archive = formats::is_archive_path(archive);
+    let kind = formats::ArchiveKind::of_path(archive);
 
     if let Some(format) = formats::outer_format(archive) {
         if config.is_format_disabled(format.id) {
@@ -334,17 +341,17 @@ fn process_one(
         }
     }
 
-    // Non-archive formats (gz, xz, zst, ...) hold a single file and never
-    // need a password; unpack straight into the destination directory. The
+    // Single-file formats (gz, xz, zst, ...) hold one file and never need a
+    // password; unpack straight into the destination directory. The
     // configured conflict policy still applies to the produced file.
-    if !is_archive {
+    if !kind.is_archive() {
         let conflicts = detect_single_file_conflict(archive, &workdir);
         if let Err(message) =
             apply_conflict_policy(&conflicts, config, answer_rx, event_tx, ctx, index)
         {
             return fail(index, message);
         }
-        let result = result_name(archive, false, None);
+        let result = result_name(archive, kind, None);
         return match ouch.decompress(&source, &workdir, Target::Here, None, current_pid, &log) {
             Ok(outcome) if outcome.success => finish_success(
                 index,
@@ -387,7 +394,7 @@ fn process_one(
             password = found;
             if config.decompress_mode == DecompressMode::Smart {
                 let roots = modes::roots_from_listing(&text);
-                target = modes::choose_target(DecompressMode::Smart, true, &roots);
+                target = modes::choose_target(DecompressMode::Smart, kind, &roots);
                 log_line(
                     event_tx,
                     ctx,
@@ -425,8 +432,10 @@ fn process_one(
 
     // When extracting "here" and the result name differs from the archive
     // (e.g. `foo.zip` containing `bar.ipa`), report the resulting name.
-    let result = if target == Target::Here {
-        result_name(archive, true, listing.as_deref())
+    // Reported once, on the first successful attempt, so the later attempts
+    // can take it instead of cloning.
+    let mut result = if target == Target::Here {
+        result_name(archive, kind, listing.as_deref())
     } else {
         None
     };
@@ -475,7 +484,7 @@ fn process_one(
                     archive,
                     &cleanup_parts,
                     target.label(),
-                    result.clone(),
+                    result.take(),
                     config,
                     event_tx,
                     ctx,
@@ -532,7 +541,7 @@ fn process_one(
                             archive,
                             &cleanup_parts,
                             target.label(),
-                            result.clone(),
+                            result.take(),
                             config,
                             event_tx,
                             ctx,
@@ -555,7 +564,10 @@ fn process_one(
 }
 
 /// Resolves the base directory used for this archive and creates it when needed.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "destination resolution needs the batch state it also updates"
+)]
 fn resolve_workdir(
     archive: &Path,
     config: &Config,
@@ -579,7 +591,14 @@ fn resolve_workdir(
             Some(dir) => dir.clone(),
             None => {
                 let dir = prompt_destination(
-                    archive, true, suggested, answer_rx, event_tx, index, cancel_all, ctx,
+                    archive,
+                    PromptScope::Batch,
+                    suggested,
+                    answer_rx,
+                    event_tx,
+                    index,
+                    cancel_all,
+                    ctx,
                 )?;
                 *last_destination = Some(dir.clone());
                 return Ok(dir);
@@ -587,7 +606,14 @@ fn resolve_workdir(
         },
         DestinationMode::AskEach => {
             let dir = prompt_destination(
-                archive, false, suggested, answer_rx, event_tx, index, cancel_all, ctx,
+                archive,
+                PromptScope::Single,
+                suggested,
+                answer_rx,
+                event_tx,
+                index,
+                cancel_all,
+                ctx,
             )?;
             *last_destination = Some(dir.clone());
             return Ok(dir);
@@ -596,11 +622,23 @@ fn resolve_workdir(
     ensure_directory(dir)
 }
 
+/// Whether a destination prompt applies to the whole batch or one archive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptScope {
+    /// The answer is reused for the remaining archives.
+    Batch,
+    /// The answer applies to this archive only.
+    Single,
+}
+
 /// Blocks the worker until the UI supplies a destination directory.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the worker context is threaded explicitly to keep the function pure"
+)]
 fn prompt_destination(
     archive: &Path,
-    batch: bool,
+    scope: PromptScope,
     suggested: PathBuf,
     answer_rx: &Receiver<JobAnswer>,
     event_tx: &Sender<JobEvent>,
@@ -620,7 +658,7 @@ fn prompt_destination(
             JobEvent::NeedDestination {
                 index,
                 archive: archive.to_path_buf(),
-                batch,
+                batch: scope == PromptScope::Batch,
                 suggested: suggested.clone(),
                 error: last_error.take(),
             },
@@ -882,7 +920,10 @@ fn cleanup_sources(
 
 /// Applies the configured post-extraction action to every source part, then
 /// builds the success event.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "success reporting forwards the archive, its parts and the batch context"
+)]
 fn finish_success(
     index: usize,
     archive: &Path,
@@ -922,9 +963,9 @@ fn finish_success(
 /// Obvious means the result equals the archive's stem (`foo.tar.gz` -> `foo`)
 /// or just extends it with another extension (`foo.zip` -> `foo.ipa`). Only a
 /// genuinely different name (`photos.zip` -> `vacation`) is reported.
-fn result_name(archive: &Path, is_archive: bool, listing: Option<&str>) -> Option<String> {
+fn result_name(archive: &Path, kind: ArchiveKind, listing: Option<&str>) -> Option<String> {
     let archive_stem = formats::stem_without_known_extensions(archive);
-    let name = if is_archive {
+    let name = if kind.is_archive() {
         let roots = modes::roots_from_listing(listing?);
         if roots.len() == 1 {
             roots.into_iter().next()?
@@ -1020,6 +1061,44 @@ fn process_io(pid: u32) -> Option<(u64, u64)> {
 /// the displayed speed steadier and less twitchy.
 const SPEED_TAU: f64 = 3.0;
 
+/// Lossy numeric conversions for the progress display.
+///
+/// `ouch` exposes raw byte counters and the UI only renders them, so the
+/// rounding and saturation rules of `as` are acceptable here. Keeping them in
+/// one module keeps the casts out of the poller logic.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "progress figures are display-only estimates"
+)]
+mod progress_math {
+    /// `part / whole`, clamped to `0.0..=1.0` (`0.0` when `whole` is zero).
+    pub fn fraction_of(part: u64, whole: u64) -> f32 {
+        if whole == 0 {
+            0.0
+        } else {
+            (part as f64 / whole as f64).min(1.0) as f32
+        }
+    }
+
+    /// Bytes per second for a sample of `bytes` taken over `secs` seconds.
+    pub fn per_second(bytes: u64, secs: f64) -> f64 {
+        bytes as f64 / secs
+    }
+
+    /// Full seconds needed for `remaining` bytes at `rate` bytes per second.
+    pub fn eta_secs(remaining: u64, rate: f64) -> Option<u64> {
+        (rate > 0.0).then(|| (remaining as f64 / rate) as u64)
+    }
+
+    /// Truncates a fractional rate to the whole number shown in the UI.
+    pub fn trunc_rate(rate: f64) -> u64 {
+        rate.max(0.0) as u64
+    }
+}
+
 /// Exponential moving average of a transfer rate, weighted by the elapsed time
 /// so it does not depend on how often it is sampled. `previous` is `None` on
 /// the first sample, so the rate starts at the instantaneous value.
@@ -1027,7 +1106,7 @@ fn smooth_speed(previous: Option<f64>, delta_bytes: u64, secs: f64) -> f64 {
     if secs <= 0.0 {
         return previous.unwrap_or(0.0);
     }
-    let instant = delta_bytes as f64 / secs;
+    let instant = progress_math::per_second(delta_bytes, secs);
     match previous {
         Some(prev) => {
             let alpha = 1.0 - (-secs / SPEED_TAU).exp();
@@ -1040,7 +1119,7 @@ fn smooth_speed(previous: Option<f64>, delta_bytes: u64, secs: f64) -> f64 {
 /// Estimated seconds left for `remaining` bytes at `rate` bytes per second.
 /// Returns `None` when the rate is not positive.
 fn estimate_eta(remaining: u64, rate: f64) -> Option<u64> {
-    (rate > 0.0).then(|| (remaining as f64 / rate) as u64)
+    progress_math::eta_secs(remaining, rate)
 }
 
 /// Stops the progress poller thread when dropped.
@@ -1154,7 +1233,7 @@ fn run_progress_poller(
                         last_speed_time = now;
                     }
                 }
-                let fraction = (read as f64 / total as f64).min(1.0) as f32;
+                let fraction = progress_math::fraction_of(read, total);
                 let part_index = part_index_for(read, &cumulative);
                 let eta_secs = estimate_eta(total.saturating_sub(read), read_speed.unwrap_or(0.0))
                     .unwrap_or(0);
@@ -1163,7 +1242,7 @@ fn run_progress_poller(
                     fraction,
                     total,
                     part_index,
-                    speed_bps: write_speed.unwrap_or(0.0) as u64,
+                    speed_bps: progress_math::trunc_rate(write_speed.unwrap_or(0.0)),
                     eta_secs,
                 });
                 ctx.request_repaint();
@@ -1199,7 +1278,10 @@ enum SkipReason {
 /// works or the user skips/cancels. Other failures are returned as
 /// [`SkipReason::HardError`] so the caller never asks for a password the
 /// archive does not have.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "listing needs the password prompt channel and the batch state"
+)]
 fn obtain_listing(
     ouch: &OuchClient,
     archive: &Path,
@@ -1500,7 +1582,7 @@ mod tests {
 
         let dir = prompt_destination(
             &archive,
-            false,
+            PromptScope::Single,
             base.clone(),
             &answer_rx,
             &event_tx,
@@ -1615,7 +1697,7 @@ mod tests {
         assert_eq!(
             result_name(
                 Path::new("/tmp/PatreonTV-unsigned.zip"),
-                true,
+                ArchiveKind::Archive,
                 Some("PatreonTV-unsigned.ipa\n")
             ),
             None
@@ -1624,25 +1706,36 @@ mod tests {
         assert_eq!(
             result_name(
                 Path::new("/tmp/crispasr-linux-x86_64-hip.tar.gz"),
-                true,
+                ArchiveKind::Archive,
                 Some("crispasr-linux-x86_64-hip\n")
             ),
             None
         );
-        // Non-archive formats simply drop the compression extension.
+        // Single-file streams simply drop the compression extension.
         assert_eq!(
-            result_name(Path::new("/tmp/report.txt.gz"), false, None),
+            result_name(Path::new("/tmp/report.txt.gz"), ArchiveKind::Stream, None),
             None
         );
-        assert_eq!(result_name(Path::new("/tmp/file.gz"), false, None), None);
+        assert_eq!(
+            result_name(Path::new("/tmp/file.gz"), ArchiveKind::Stream, None),
+            None
+        );
         // Not obvious: the root has a genuinely different name.
         assert_eq!(
-            result_name(Path::new("/tmp/photos.zip"), true, Some("vacation/\n")),
+            result_name(
+                Path::new("/tmp/photos.zip"),
+                ArchiveKind::Archive,
+                Some("vacation/\n")
+            ),
             Some("vacation".to_string())
         );
         // Multiple roots are extracted into a folder named after the archive.
         assert_eq!(
-            result_name(Path::new("/tmp/a.zip"), true, Some("x\ny\n")),
+            result_name(
+                Path::new("/tmp/a.zip"),
+                ArchiveKind::Archive,
+                Some("x\ny\n")
+            ),
             None
         );
     }

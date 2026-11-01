@@ -136,18 +136,21 @@ pub fn terminate_process(pid: u32) {
         return;
     }
 
+    // SAFETY: `pid` is a positive PID, checked above. `kill` only touches
+    // kernel state and its failure (the process already exited) is harmless.
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
-        if process_finished(pid as u32) {
+        if process_finished(pid.cast_unsigned()) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
+    // SAFETY: same as above; the process outlived the grace period.
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }

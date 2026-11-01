@@ -258,6 +258,10 @@ impl Config {
     }
 
     /// Loads the config from an explicit path.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a corrupt config is reported before the UI exists to show it"
+    )]
     pub fn load_from(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|err| {
