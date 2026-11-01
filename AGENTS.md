@@ -96,8 +96,9 @@ reason.
 ## Branching and releases
 
 - `develop` is the integration branch; `main` holds released code.
-- Branch off `develop` using a descriptive prefix (`feature/...`, `fix/...`,
-  `docs/...`) and merge back into `develop`.
+- **Every change starts on its own branch.** Never commit directly to `develop`
+  or `main`: branch off `develop` using a descriptive prefix (`feature/...`,
+  `fix/...`, `docs/...`, `chore/...`) and merge it back into `develop`.
 - Merge `develop` into `main` only when preparing a release, then push a tag
   `vX.Y.Z`. `.github/workflows/release.yml` builds the AppImages and creates the
   GitHub release.
