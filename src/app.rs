@@ -23,6 +23,10 @@ const JOINING_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 /// Failures and failed entries, so they stand out from the rest of the text.
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x30, 0x25);
 
+/// How long the interface-size slider must stay still before the restart hint
+/// is shown, so dragging it does not open the modal on every step.
+const SCALE_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Tabs inside the settings window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
@@ -234,6 +238,11 @@ pub struct App {
     /// True while the interface-size slider is dragged, to avoid re-applying
     /// the (expensive) zoom on every frame.
     scale_dragging: bool,
+    /// When the restart hint becomes due. Reset on every slider change while
+    /// dragging, so it waits for the last change.
+    scale_restart_deadline: Option<std::time::Instant>,
+    /// True while the restart hint is on screen.
+    scale_restart_prompt: bool,
     files: Vec<FileEntry>,
     log: Vec<String>,
     status_line: StatusLine,
@@ -376,6 +385,8 @@ impl App {
             config_dirty: false,
             last_config_save: None,
             scale_dragging: false,
+            scale_restart_deadline: None,
+            scale_restart_prompt: false,
             files: Vec::new(),
             log: Vec::new(),
             status_line: StatusLine::default(),
@@ -635,6 +646,29 @@ impl App {
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
+    }
+
+    /// Shows the restart hint once the interface-size slider has been still for
+    /// [`SCALE_RESTART_DELAY`]. While it is being dragged the deadline keeps
+    /// moving, so the modal never interrupts a drag.
+    fn pump_scale_restart(&mut self, ctx: &egui::Context) {
+        if self.scale_restart_prompt {
+            return;
+        }
+        let Some(mut deadline) = self.scale_restart_deadline else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if self.scale_dragging {
+            deadline = now + SCALE_RESTART_DELAY;
+            self.scale_restart_deadline = Some(deadline);
+        }
+        if now >= deadline {
+            self.scale_restart_deadline = None;
+            self.scale_restart_prompt = true;
+            return;
+        }
+        ctx.request_repaint_after(deadline - now);
     }
 
     fn handle_event(&mut self, event: JobEvent) {
@@ -1000,6 +1034,22 @@ impl App {
 
         self.close_requested = true;
     }
+
+    /// Starts a fresh instance so the stored interface size lays out the window
+    /// correctly, then closes this one. The current window stays open when the
+    /// new process cannot be spawned.
+    fn restart_app(&mut self) {
+        self.flush_config(Flush::Forced);
+        match crate::system::restart() {
+            Ok(()) => self.close_requested = true,
+            Err(err) => {
+                let message = format!("{}: {err}", self.i18n.t("scale_restart.failed"));
+                self.status_line = StatusLine::error(message.clone());
+                self.push_log(message.clone());
+                self.error_popup = Some(message);
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1019,6 +1069,7 @@ impl eframe::App for App {
             ctx.set_zoom_factor(ui_scale::zoom_factor(self.config.ui_scale));
             self.applied_scale = self.config.ui_scale;
         }
+        self.pump_scale_restart(&ctx);
 
         // Remember the size to go back to. `ViewportInfo::inner_rect` cannot be
         // used: Wayland does not expose the window position, so it is `None`
@@ -1094,6 +1145,7 @@ impl eframe::App for App {
         if self.view == Some(View::Settings) {
             self.ui_bulk_password_modal(&ctx);
         }
+        self.ui_scale_restart(&ctx);
 
         // Persist any pending settings change (debounced).
         self.flush_config(Flush::Debounced);
@@ -1364,6 +1416,7 @@ impl App {
             || self.confirm_close
             || self.error_popup.is_some()
             || self.bulk_password_open
+            || self.scale_restart_prompt
     }
 
     /// Shows an overlay on top of the main window, growing the window if the
@@ -1871,6 +1924,7 @@ impl App {
         self.scale_dragging = response.dragged();
         if response.changed() {
             self.config.ui_scale = ui_scale::from_percent_value(scale);
+            self.scale_restart_deadline = Some(std::time::Instant::now() + SCALE_RESTART_DELAY);
             self.persist();
         }
 
@@ -1900,9 +1954,13 @@ impl App {
         ui.separator();
         if ui.button(self.i18n.t("settings.reset")).clicked() {
             // Keep saved passwords; reset everything else.
+            let previous_scale = self.config.ui_scale;
             let passwords = std::mem::take(&mut self.config.passwords);
             self.config = Config::default();
             self.config.passwords = passwords;
+            if self.config.ui_scale != previous_scale {
+                self.scale_restart_deadline = Some(std::time::Instant::now() + SCALE_RESTART_DELAY);
+            }
             self.destination_dir_input.clear();
             self.i18n = I18n::new(self.config.language);
             theme::apply(ui.ctx(), self.config.theme);
@@ -2295,6 +2353,54 @@ impl App {
         } else if close {
             self.confirm_close = false;
             self.abort_and_close();
+        }
+    }
+
+    /// Offers to restart after the interface-size slider changes: the zoom is
+    /// applied live, but a fresh start is what lays the window out correctly.
+    fn ui_scale_restart(&mut self, ctx: &egui::Context) {
+        if !self.scale_restart_prompt {
+            return;
+        }
+
+        let mut restart = false;
+        let mut dismiss = false;
+        egui::Modal::new(egui::Id::unique("scale-restart-modal")).show(ctx, |ui| {
+            let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
+            ui.set_min_width(max_width.min(380.0));
+            ui.set_max_width(max_width);
+            ui.heading(self.i18n.t("scale_restart.title"));
+            ui.label(self.i18n.t("scale_restart.body"));
+            if self.running {
+                ui.label(
+                    egui::RichText::new(self.i18n.t("scale_restart.running"))
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let button = ui
+                    .add_enabled(
+                        !self.running,
+                        egui::Button::new(self.i18n.t("scale_restart.restart")),
+                    )
+                    .on_disabled_hover_text(self.i18n.t("scale_restart.running"));
+                if button.clicked() {
+                    restart = true;
+                }
+                if ui.button(self.i18n.t("common.close")).clicked() {
+                    dismiss = true;
+                }
+            });
+        });
+
+        if restart {
+            self.scale_restart_prompt = false;
+            self.restart_app();
+            ctx.request_repaint();
+        } else if dismiss {
+            self.scale_restart_prompt = false;
         }
     }
 

@@ -15,6 +15,23 @@ pub fn open_url(url: &str) {
     let _ = Command::new("xdg-open").arg(url).spawn();
 }
 
+/// Relaunches the app in a new process.
+///
+/// Inside an AppImage `current_exe` points into the read-only mount, which is
+/// removed together with this process, so `$APPIMAGE` takes precedence.
+///
+/// # Errors
+///
+/// Returns the error when the executable path cannot be resolved or spawned.
+pub fn restart() -> std::io::Result<()> {
+    let executable = match std::env::var_os("APPIMAGE") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => std::env::current_exe()?,
+    };
+    Command::new(executable).spawn()?;
+    Ok(())
+}
+
 /// Moves a file to the trash using `gio` or `trash-put`.
 ///
 /// Returns false if neither tool is available, so callers can warn the user
