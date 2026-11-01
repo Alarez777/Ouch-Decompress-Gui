@@ -28,6 +28,10 @@ pub const WINDOW_TITLE: &str = "Ouch Decompress";
 /// an overlay closes if the size before opening it is unknown.
 pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [580.0, 300.0];
 
+#[expect(
+    clippy::print_stdout,
+    reason = "a CLI's stdout is its output; the GUI never uses it"
+)]
 fn main() -> eframe::Result<()> {
     let options = parse_args();
 
@@ -59,7 +63,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         WINDOW_TITLE,
         native_options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, options.files, options.settings)))),
+        Box::new(move |cc| {
+            let startup = if options.settings {
+                app::Startup::Settings
+            } else {
+                app::Startup::Extract
+            };
+            Ok(Box::new(app::App::new(cc, options.files, startup)))
+        }),
     )
 }
 
@@ -72,6 +83,10 @@ struct CliOptions {
     version: bool,
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "command-line diagnostics before the window exists"
+)]
 fn parse_args() -> CliOptions {
     let mut options = CliOptions::default();
     let mut only_files = false;
@@ -96,6 +111,10 @@ fn parse_args() -> CliOptions {
     options
 }
 
+#[expect(
+    clippy::print_stdout,
+    reason = "`--help` writes to stdout, as every CLI does"
+)]
 fn print_help() {
     println!(
         "{name} {version}\n\

@@ -89,10 +89,10 @@ pub fn prepare(
 /// The base name of the split without its volume number (`def.7z.001` ->
 /// `def.7z`), so `ouch` names its output folder after the archive.
 fn base_name(archive: &Path) -> String {
-    let name = archive
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "archive".to_string());
+    let name = archive.file_name().map_or_else(
+        || "archive".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     match name.rsplit_once('.') {
         Some((prefix, last)) if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) => {
             prefix.to_string()
@@ -154,7 +154,7 @@ fn copy_parts(
             writer
                 .write_all(&buffer[..read])
                 .with_context(|| format!("writing {}", dest.display()))?;
-            copied += read as u64;
+            copied += u64::try_from(read).expect("a read length fits in u64");
             progress(copied, total);
         }
     }
@@ -167,17 +167,14 @@ fn copy_parts(
 
 /// Size of a file, or 0 when it cannot be read.
 fn file_size(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 /// Monotonic-ish unique suffix for temporary names.
 fn unique_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0)
+        .map_or(0, |elapsed| elapsed.as_nanos())
 }
 
 /// True when `path` exists and is writable by this user.
@@ -187,6 +184,8 @@ fn is_writable(path: &Path) -> bool {
     let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
+    // SAFETY: `path` is a valid NUL-terminated string that outlives the call,
+    // and `access` only reads it.
     unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
 }
 
@@ -195,9 +194,20 @@ fn available_space(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` is a plain C struct, so an all-zero bit pattern is
+    // valid, and `statvfs(3)` fills it before any field is read.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0;
-    ok.then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
+    // SAFETY: `path` is a valid NUL-terminated string and `stat` is a live
+    // `statvfs` that the call writes to.
+    let ok = unsafe { libc::statvfs(path.as_ptr(), &raw mut stat) } == 0;
+    if !ok {
+        return None;
+    }
+    // `statvfs` fields are 64-bit on every supported target (x86_64, aarch64),
+    // so no conversion is needed before multiplying them.
+    let block_size = stat.f_frsize;
+    let free_blocks = stat.f_bavail;
+    free_blocks.checked_mul(block_size)
 }
 
 /// `MemAvailable` from `/proc/meminfo`, in bytes.
@@ -252,9 +262,10 @@ mod tests {
         std::fs::write(&second, b"world").unwrap();
 
         let mut last = (0u64, 0u64);
+        let parts = [first, second];
         let prepared = prepare(
-            &first,
-            &[first.clone(), second.clone()],
+            &parts[0],
+            &parts,
             SplitKind::Concat,
             &AtomicBool::new(false),
             |c, t| {
@@ -282,9 +293,10 @@ mod tests {
         std::fs::write(&first, b"hello ").unwrap();
         std::fs::write(&second, b"world").unwrap();
 
+        let parts = [first, second];
         let prepared = prepare(
-            &first,
-            &[first.clone(), second.clone()],
+            &parts[0],
+            &parts,
             SplitKind::Concat,
             &AtomicBool::new(true),
             |_, _| {},

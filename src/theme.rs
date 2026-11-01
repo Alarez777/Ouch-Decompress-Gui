@@ -16,7 +16,7 @@ impl ThemeChoice {
     pub const ALL: [ThemeChoice; 3] = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             ThemeChoice::System => "theme.system",
             ThemeChoice::Light => "theme.light",

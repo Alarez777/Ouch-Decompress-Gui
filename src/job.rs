@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
-use crate::formats;
+use crate::formats::{self, ArchiveKind};
 use crate::i18n::I18n;
 use crate::modes::{self, DecompressMode, DestinationMode, Target};
 use crate::multivolume;
@@ -114,6 +114,25 @@ pub struct JobController {
     pub current_pid: Arc<AtomicU32>,
 }
 
+/// State the worker's steps share: where to report, how to ask the UI and how
+/// to stop.
+struct WorkerCtx<'a> {
+    /// Events for the UI; every one is followed by a repaint request.
+    events: &'a Sender<JobEvent>,
+    /// egui context, used to wake the UI after each event.
+    ui: &'a egui::Context,
+    /// Channel the UI answers prompts on.
+    answers: &'a Receiver<JobAnswer>,
+    /// Set by the UI when the whole batch must stop.
+    cancel: &'a Arc<AtomicBool>,
+    /// PID of the running `ouch` process, or 0 when none is running.
+    pid: &'a Arc<AtomicU32>,
+    /// Batch configuration.
+    config: &'a Config,
+    /// Translations for the messages built here.
+    i18n: &'a I18n,
+}
+
 /// Spawns the extraction worker.
 ///
 /// Returns the controller used to answer prompts, plus the receiver of worker
@@ -132,39 +151,30 @@ pub fn spawn(
 
     let controller = JobController {
         answer_tx,
-        cancel_all: cancel_all.clone(),
-        current_pid: current_pid.clone(),
+        cancel_all: Arc::clone(&cancel_all),
+        current_pid: Arc::clone(&current_pid),
     };
 
     thread::spawn(move || {
-        run(
-            ouch,
-            archives,
-            config,
-            i18n,
-            event_tx,
-            answer_rx,
-            cancel_all,
-            current_pid,
-            ctx,
-        );
+        let worker = WorkerCtx {
+            events: &event_tx,
+            ui: &ctx,
+            answers: &answer_rx,
+            cancel: &cancel_all,
+            pid: &current_pid,
+            config: &config,
+            i18n: &i18n,
+        };
+        run(&ouch, &archives, &worker);
     });
 
     (controller, event_rx)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(
-    ouch: OuchClient,
-    archives: Vec<PathBuf>,
-    config: Config,
-    i18n: I18n,
-    event_tx: Sender<JobEvent>,
-    answer_rx: Receiver<JobAnswer>,
-    cancel_all: Arc<AtomicBool>,
-    current_pid: Arc<AtomicU32>,
-    ctx: egui::Context,
-) {
+/// Runs the whole batch, one archive at a time.
+fn run(ouch: &OuchClient, archives: &[PathBuf], worker: &WorkerCtx<'_>) {
+    let event_tx = worker.events;
+    let ui = worker.ui;
     // Password remembered from the first successful prompt, reused afterwards.
     let mut batch_password: Option<String> = None;
     // Last directory chosen by a prompt: the batch destination in
@@ -172,46 +182,41 @@ fn run(
     let mut last_destination: Option<PathBuf> = None;
 
     for (index, archive) in archives.iter().enumerate() {
-        if cancel_all.load(Ordering::Relaxed) {
+        if worker.cancel.load(Ordering::Relaxed) {
             break;
         }
-        send(&event_tx, &ctx, JobEvent::Started { index });
+        send(event_tx, ui, JobEvent::Started { index });
 
         let event = process_one(
-            &ouch,
+            ouch,
             archive,
-            &config,
-            &i18n,
+            index,
             &mut batch_password,
             &mut last_destination,
-            &answer_rx,
-            &event_tx,
-            index,
-            &current_pid,
-            &cancel_all,
-            &ctx,
+            worker,
         );
-        send(&event_tx, &ctx, event);
+        send(event_tx, ui, event);
     }
 
-    send(&event_tx, &ctx, JobEvent::AllDone);
+    send(event_tx, ui, JobEvent::AllDone);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Extracts one archive and reports the result.
 fn process_one(
     ouch: &OuchClient,
     archive: &Path,
-    config: &Config,
-    i18n: &I18n,
+    index: usize,
     batch_password: &mut Option<String>,
     last_destination: &mut Option<PathBuf>,
-    answer_rx: &Receiver<JobAnswer>,
-    event_tx: &Sender<JobEvent>,
-    index: usize,
-    current_pid: &Arc<AtomicU32>,
-    cancel_all: &Arc<AtomicBool>,
-    ctx: &egui::Context,
+    worker: &WorkerCtx<'_>,
 ) -> JobEvent {
+    let event_tx = worker.events;
+    let ctx = worker.ui;
+    let answer_rx = worker.answers;
+    let cancel_all = worker.cancel;
+    let current_pid = worker.pid;
+    let config = worker.config;
+    let i18n = worker.i18n;
     if !archive.exists() {
         return JobEvent::Done {
             index,
@@ -238,8 +243,13 @@ fn process_one(
     // so it works even for a single huge file (where counting entries does
     // not). The guard stops the poller when this function returns. `current_pid`
     // is shared with the UI so it can kill the child if the user closes.
-    let _progress =
-        ProgressPoller::spawn(index, &cleanup_parts, current_pid.clone(), event_tx, ctx);
+    let _progress = ProgressPoller::spawn(
+        index,
+        &cleanup_parts,
+        Arc::clone(current_pid),
+        event_tx,
+        ctx,
+    );
 
     // Prepare the file `ouch` should read. For a raw split (`name.7z.001`) this
     // concatenates the volumes into a temporary (see `multivolume`); other
@@ -263,11 +273,7 @@ fn process_one(
         split_kind,
         cancel_all,
         |copied, total| {
-            let fraction = if total == 0 {
-                0.0
-            } else {
-                copied as f32 / total as f32
-            };
+            let fraction = progress_math::fraction_of(copied, total);
             let _ = send(
                 event_tx,
                 ctx,
@@ -299,16 +305,7 @@ fn process_one(
         Err(err) => return fail(index, err.to_string()),
     };
     let source = absolute(prepared.path());
-    let workdir = match resolve_workdir(
-        archive,
-        config,
-        last_destination,
-        answer_rx,
-        event_tx,
-        index,
-        cancel_all,
-        ctx,
-    ) {
+    let workdir = match resolve_workdir(archive, index, last_destination, worker) {
         Ok(workdir) => workdir,
         Err(message) => return fail(index, message),
     };
@@ -319,7 +316,7 @@ fn process_one(
         format!("destination: {}", workdir.display()),
     );
 
-    let is_archive = formats::is_archive_path(archive);
+    let kind = formats::ArchiveKind::of_path(archive);
 
     if let Some(format) = formats::outer_format(archive) {
         if config.is_format_disabled(format.id) {
@@ -334,27 +331,25 @@ fn process_one(
         }
     }
 
-    // Non-archive formats (gz, xz, zst, ...) hold a single file and never
-    // need a password; unpack straight into the destination directory. The
+    // Single-file formats (gz, xz, zst, ...) hold one file and never need a
+    // password; unpack straight into the destination directory. The
     // configured conflict policy still applies to the produced file.
-    if !is_archive {
+    if !kind.is_archive() {
         let conflicts = detect_single_file_conflict(archive, &workdir);
         if let Err(message) =
             apply_conflict_policy(&conflicts, config, answer_rx, event_tx, ctx, index)
         {
             return fail(index, message);
         }
-        let result = result_name(archive, false, None);
+        let result = result_name(archive, kind, None);
         return match ouch.decompress(&source, &workdir, Target::Here, None, current_pid, &log) {
             Ok(outcome) if outcome.success => finish_success(
                 index,
                 archive,
                 &cleanup_parts,
                 "here",
-                result,
-                config,
-                event_tx,
-                ctx,
+                result.as_deref(),
+                worker,
             ),
             Ok(outcome) => fail(index, outcome_message(&outcome)),
             Err(err) => fail(index, err.to_string()),
@@ -367,27 +362,16 @@ fn process_one(
     let mut password: Option<String> = None;
     let mut listing: Option<String> = None;
     let mut target = match config.decompress_mode {
-        DecompressMode::Folder => Target::Folder,
+        DecompressMode::Folder | DecompressMode::Smart => Target::Folder,
         DecompressMode::Here => Target::Here,
-        DecompressMode::Smart => Target::Folder,
     };
 
-    match obtain_listing(
-        ouch,
-        &source,
-        config,
-        batch_password,
-        answer_rx,
-        event_tx,
-        index,
-        cancel_all,
-        ctx,
-    ) {
+    match obtain_listing(ouch, &source, index, batch_password, worker) {
         Ok((text, found)) => {
             password = found;
             if config.decompress_mode == DecompressMode::Smart {
                 let roots = modes::roots_from_listing(&text);
-                target = modes::choose_target(DecompressMode::Smart, true, &roots);
+                target = modes::choose_target(DecompressMode::Smart, kind, &roots);
                 log_line(
                     event_tx,
                     ctx,
@@ -426,7 +410,7 @@ fn process_one(
     // When extracting "here" and the result name differs from the archive
     // (e.g. `foo.zip` containing `bar.ipa`), report the resulting name.
     let result = if target == Target::Here {
-        result_name(archive, true, listing.as_deref())
+        result_name(archive, kind, listing.as_deref())
     } else {
         None
     };
@@ -475,10 +459,8 @@ fn process_one(
                     archive,
                     &cleanup_parts,
                     target.label(),
-                    result.clone(),
-                    config,
-                    event_tx,
-                    ctx,
+                    result.as_deref(),
+                    worker,
                 );
             }
             Ok(outcome) => {
@@ -532,10 +514,8 @@ fn process_one(
                             archive,
                             &cleanup_parts,
                             target.label(),
-                            result.clone(),
-                            config,
-                            event_tx,
-                            ctx,
+                            result.as_deref(),
+                            worker,
                         );
                     }
                     Ok(outcome) => last_error = outcome_message(&outcome),
@@ -549,23 +529,19 @@ fn process_one(
             }
             JobAnswer::Skip => return fail(index, "skipped".into()),
             JobAnswer::CancelBatch => return fail(index, "cancelled".into()),
-            JobAnswer::Overwrite | JobAnswer::Destination(_) => continue,
+            JobAnswer::Overwrite | JobAnswer::Destination(_) => {}
         }
     }
 }
 
 /// Resolves the base directory used for this archive and creates it when needed.
-#[allow(clippy::too_many_arguments)]
 fn resolve_workdir(
     archive: &Path,
-    config: &Config,
-    last_destination: &mut Option<PathBuf>,
-    answer_rx: &Receiver<JobAnswer>,
-    event_tx: &Sender<JobEvent>,
     index: usize,
-    cancel_all: &Arc<AtomicBool>,
-    ctx: &egui::Context,
+    last_destination: &mut Option<PathBuf>,
+    worker: &WorkerCtx<'_>,
 ) -> Result<PathBuf, String> {
+    let config = worker.config;
     let suggested = last_destination
         .clone()
         .unwrap_or_else(|| absolute(&parent_dir(archive)));
@@ -575,20 +551,18 @@ fn resolve_workdir(
             Some(dir) if !dir.as_os_str().is_empty() => absolute(dir),
             _ => return Err("no destination folder configured in settings".into()),
         },
-        DestinationMode::AskBatch => match last_destination.as_ref() {
-            Some(dir) => dir.clone(),
-            None => {
-                let dir = prompt_destination(
-                    archive, true, suggested, answer_rx, event_tx, index, cancel_all, ctx,
-                )?;
+        DestinationMode::AskBatch => {
+            if let Some(dir) = last_destination.as_ref() {
+                dir.clone()
+            } else {
+                let dir =
+                    prompt_destination(archive, PromptScope::Batch, suggested, index, worker)?;
                 *last_destination = Some(dir.clone());
                 return Ok(dir);
             }
-        },
+        }
         DestinationMode::AskEach => {
-            let dir = prompt_destination(
-                archive, false, suggested, answer_rx, event_tx, index, cancel_all, ctx,
-            )?;
+            let dir = prompt_destination(archive, PromptScope::Single, suggested, index, worker)?;
             *last_destination = Some(dir.clone());
             return Ok(dir);
         }
@@ -596,18 +570,27 @@ fn resolve_workdir(
     ensure_directory(dir)
 }
 
+/// Whether a destination prompt applies to the whole batch or one archive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptScope {
+    /// The answer is reused for the remaining archives.
+    Batch,
+    /// The answer applies to this archive only.
+    Single,
+}
+
 /// Blocks the worker until the UI supplies a destination directory.
-#[allow(clippy::too_many_arguments)]
 fn prompt_destination(
     archive: &Path,
-    batch: bool,
+    scope: PromptScope,
     suggested: PathBuf,
-    answer_rx: &Receiver<JobAnswer>,
-    event_tx: &Sender<JobEvent>,
     index: usize,
-    cancel_all: &Arc<AtomicBool>,
-    ctx: &egui::Context,
+    worker: &WorkerCtx<'_>,
 ) -> Result<PathBuf, String> {
+    let event_tx = worker.events;
+    let ctx = worker.ui;
+    let answer_rx = worker.answers;
+    let cancel_all = worker.cancel;
     let mut suggested = suggested;
     let mut last_error: Option<String> = None;
     loop {
@@ -620,7 +603,7 @@ fn prompt_destination(
             JobEvent::NeedDestination {
                 index,
                 archive: archive.to_path_buf(),
-                batch,
+                batch: scope == PromptScope::Batch,
                 suggested: suggested.clone(),
                 error: last_error.take(),
             },
@@ -642,7 +625,7 @@ fn prompt_destination(
             }
             JobAnswer::Skip => return Err("skipped".into()),
             JobAnswer::CancelBatch => return Err("cancelled".into()),
-            JobAnswer::Password(_) | JobAnswer::Overwrite => continue,
+            JobAnswer::Password(_) | JobAnswer::Overwrite => {}
         }
     }
 }
@@ -668,8 +651,7 @@ fn parent_dir(archive: &Path) -> PathBuf {
     archive
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// True when `name` is a single, normal path component.
@@ -697,8 +679,7 @@ fn detect_conflicts(archive: &Path, target: Target, listing: &str, workdir: &Pat
             let destination = workdir.join(stem);
             let non_empty = destination
                 .read_dir()
-                .map(|mut entries| entries.next().is_some())
-                .unwrap_or(false);
+                .is_ok_and(|mut entries| entries.next().is_some());
             if destination.is_dir() && non_empty {
                 vec![destination]
             } else {
@@ -770,7 +751,7 @@ fn apply_conflict_policy(
                     JobAnswer::Overwrite => return Ok(()),
                     JobAnswer::Skip => return Err("skipped".into()),
                     JobAnswer::CancelBatch => return Err("cancelled".into()),
-                    JobAnswer::Password(_) | JobAnswer::Destination(_) => continue,
+                    JobAnswer::Password(_) | JobAnswer::Destination(_) => {}
                 }
             }
         }
@@ -882,27 +863,22 @@ fn cleanup_sources(
 
 /// Applies the configured post-extraction action to every source part, then
 /// builds the success event.
-#[allow(clippy::too_many_arguments)]
 fn finish_success(
     index: usize,
     archive: &Path,
     parts: &[PathBuf],
     target_label: &str,
-    result: Option<String>,
-    config: &Config,
-    event_tx: &Sender<JobEvent>,
-    ctx: &egui::Context,
+    result: Option<&str>,
+    worker: &WorkerCtx<'_>,
 ) -> JobEvent {
-    let cleanup_error = cleanup_sources(parts, config, event_tx, ctx, index);
+    let cleanup_error = cleanup_sources(parts, worker.config, worker.events, worker.ui, index);
 
     let archive_name = archive
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let result_summary = result
-        .as_ref()
-        .map(|result| format!("{archive_name} → {result}"));
+    let result_summary = result.map(|result| format!("{archive_name} → {result}"));
     let message_name = result_summary
         .clone()
         .unwrap_or_else(|| archive_name.clone());
@@ -922,9 +898,9 @@ fn finish_success(
 /// Obvious means the result equals the archive's stem (`foo.tar.gz` -> `foo`)
 /// or just extends it with another extension (`foo.zip` -> `foo.ipa`). Only a
 /// genuinely different name (`photos.zip` -> `vacation`) is reported.
-fn result_name(archive: &Path, is_archive: bool, listing: Option<&str>) -> Option<String> {
+fn result_name(archive: &Path, kind: ArchiveKind, listing: Option<&str>) -> Option<String> {
     let archive_stem = formats::stem_without_known_extensions(archive);
-    let name = if is_archive {
+    let name = if kind.is_archive() {
         let roots = modes::roots_from_listing(listing?);
         if roots.len() == 1 {
             roots.into_iter().next()?
@@ -957,10 +933,10 @@ fn fail(index: usize, message: String) -> JobEvent {
 
 /// Extracts the most relevant message from an ouch outcome.
 fn outcome_message(outcome: &crate::ouch::DecompressOutcome) -> String {
-    if !outcome.stderr.trim().is_empty() {
-        outcome.stderr.trim().to_string()
-    } else {
+    if outcome.stderr.trim().is_empty() {
         outcome.stdout.trim().to_string()
+    } else {
+        outcome.stderr.trim().to_string()
     }
 }
 
@@ -1020,6 +996,44 @@ fn process_io(pid: u32) -> Option<(u64, u64)> {
 /// the displayed speed steadier and less twitchy.
 const SPEED_TAU: f64 = 3.0;
 
+/// Lossy numeric conversions for the progress display.
+///
+/// `ouch` exposes raw byte counters and the UI only renders them, so the
+/// rounding and saturation rules of `as` are acceptable here. Keeping them in
+/// one module keeps the casts out of the poller logic.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "progress figures are display-only estimates"
+)]
+mod progress_math {
+    /// `part / whole`, clamped to `0.0..=1.0` (`0.0` when `whole` is zero).
+    pub fn fraction_of(part: u64, whole: u64) -> f32 {
+        if whole == 0 {
+            0.0
+        } else {
+            (part as f64 / whole as f64).min(1.0) as f32
+        }
+    }
+
+    /// Bytes per second for a sample of `bytes` taken over `secs` seconds.
+    pub fn per_second(bytes: u64, secs: f64) -> f64 {
+        bytes as f64 / secs
+    }
+
+    /// Full seconds needed for `remaining` bytes at `rate` bytes per second.
+    pub fn eta_secs(remaining: u64, rate: f64) -> Option<u64> {
+        (rate > 0.0).then(|| (remaining as f64 / rate) as u64)
+    }
+
+    /// Truncates a fractional rate to the whole number shown in the UI.
+    pub fn trunc_rate(rate: f64) -> u64 {
+        rate.max(0.0) as u64
+    }
+}
+
 /// Exponential moving average of a transfer rate, weighted by the elapsed time
 /// so it does not depend on how often it is sampled. `previous` is `None` on
 /// the first sample, so the rate starts at the instantaneous value.
@@ -1027,7 +1041,7 @@ fn smooth_speed(previous: Option<f64>, delta_bytes: u64, secs: f64) -> f64 {
     if secs <= 0.0 {
         return previous.unwrap_or(0.0);
     }
-    let instant = delta_bytes as f64 / secs;
+    let instant = progress_math::per_second(delta_bytes, secs);
     match previous {
         Some(prev) => {
             let alpha = 1.0 - (-secs / SPEED_TAU).exp();
@@ -1040,7 +1054,7 @@ fn smooth_speed(previous: Option<f64>, delta_bytes: u64, secs: f64) -> f64 {
 /// Estimated seconds left for `remaining` bytes at `rate` bytes per second.
 /// Returns `None` when the rate is not positive.
 fn estimate_eta(remaining: u64, rate: f64) -> Option<u64> {
-    (rate > 0.0).then(|| (remaining as f64 / rate) as u64)
+    progress_math::eta_secs(remaining, rate)
 }
 
 /// Stops the progress poller thread when dropped.
@@ -1062,9 +1076,7 @@ impl ProgressPoller {
         let mut cumulative = Vec::with_capacity(parts.len());
         let mut total = 0u64;
         for part in parts {
-            total += std::fs::metadata(part)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            total += std::fs::metadata(part).map_or(0, |metadata| metadata.len());
             cumulative.push(total);
         }
         if total == 0 {
@@ -1085,7 +1097,15 @@ impl ProgressPoller {
         let event_tx = event_tx.clone();
         let ctx = ctx.clone();
         let handle = thread::spawn(move || {
-            run_progress_poller(index, total, cumulative, pid_slot, event_tx, ctx, stop_rx);
+            run_progress_poller(
+                index,
+                total,
+                &cumulative,
+                &pid_slot,
+                &event_tx,
+                &ctx,
+                &stop_rx,
+            );
         });
         Some(Self {
             stop_tx,
@@ -1108,11 +1128,11 @@ impl Drop for ProgressPoller {
 fn run_progress_poller(
     index: usize,
     total: u64,
-    cumulative: Vec<u64>,
-    pid_slot: Arc<AtomicU32>,
-    event_tx: Sender<JobEvent>,
-    ctx: egui::Context,
-    stop_rx: Receiver<()>,
+    cumulative: &[u64],
+    pid_slot: &Arc<AtomicU32>,
+    event_tx: &Sender<JobEvent>,
+    ctx: &egui::Context,
+    stop_rx: &Receiver<()>,
 ) {
     // Speed/ETA tracking. Both rates are averaged over a ~1 s window and only
     // refreshed that often, so the numbers stay readable. Reset whenever the
@@ -1129,14 +1149,7 @@ fn run_progress_poller(
         if pid != 0 {
             if let Some((read, write)) = process_io(pid) {
                 let now = std::time::Instant::now();
-                if pid != last_pid {
-                    last_pid = pid;
-                    last_speed_read = read;
-                    last_speed_write = write;
-                    last_speed_time = now;
-                    read_speed = None;
-                    write_speed = None;
-                } else {
+                if pid == last_pid {
                     let window = now.duration_since(last_speed_time).as_secs_f64();
                     if window >= 1.0 {
                         read_speed = Some(smooth_speed(
@@ -1153,9 +1166,16 @@ fn run_progress_poller(
                         last_speed_write = write;
                         last_speed_time = now;
                     }
+                } else {
+                    last_pid = pid;
+                    last_speed_read = read;
+                    last_speed_write = write;
+                    last_speed_time = now;
+                    read_speed = None;
+                    write_speed = None;
                 }
-                let fraction = (read as f64 / total as f64).min(1.0) as f32;
-                let part_index = part_index_for(read, &cumulative);
+                let fraction = progress_math::fraction_of(read, total);
+                let part_index = part_index_for(read, cumulative);
                 let eta_secs = estimate_eta(total.saturating_sub(read), read_speed.unwrap_or(0.0))
                     .unwrap_or(0);
                 let _ = event_tx.send(JobEvent::Progress {
@@ -1163,16 +1183,15 @@ fn run_progress_poller(
                     fraction,
                     total,
                     part_index,
-                    speed_bps: write_speed.unwrap_or(0.0) as u64,
+                    speed_bps: progress_math::trunc_rate(write_speed.unwrap_or(0.0)),
                     eta_secs,
                 });
                 ctx.request_repaint();
             }
         }
         match stop_rx.recv_timeout(Duration::from_millis(80)) {
-            Ok(()) => break,
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -1199,18 +1218,18 @@ enum SkipReason {
 /// works or the user skips/cancels. Other failures are returned as
 /// [`SkipReason::HardError`] so the caller never asks for a password the
 /// archive does not have.
-#[allow(clippy::too_many_arguments)]
 fn obtain_listing(
     ouch: &OuchClient,
     archive: &Path,
-    config: &Config,
-    batch_password: &mut Option<String>,
-    answer_rx: &Receiver<JobAnswer>,
-    event_tx: &Sender<JobEvent>,
     index: usize,
-    cancel_all: &Arc<AtomicBool>,
-    ctx: &egui::Context,
+    batch_password: &mut Option<String>,
+    worker: &WorkerCtx<'_>,
 ) -> Result<(String, Option<String>), SkipReason> {
+    let event_tx = worker.events;
+    let ctx = worker.ui;
+    let answer_rx = worker.answers;
+    let cancel_all = worker.cancel;
+    let config = worker.config;
     let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
     let mut candidates: Vec<Option<String>> = vec![None];
     if let Some(batch) = batch_password.clone() {
@@ -1234,7 +1253,7 @@ fn obtain_listing(
         match ouch.list(archive, candidate.as_deref(), &log) {
             Ok(listing) => {
                 if candidate.is_some() {
-                    *batch_password = candidate.clone();
+                    batch_password.clone_from(&candidate);
                 }
                 return Ok((listing, candidate));
             }
@@ -1285,7 +1304,7 @@ fn obtain_listing(
             },
             JobAnswer::Skip => return Err(SkipReason::Cancelled),
             JobAnswer::CancelBatch => return Err(SkipReason::BatchCancelled),
-            JobAnswer::Overwrite | JobAnswer::Destination(_) => continue,
+            JobAnswer::Overwrite | JobAnswer::Destination(_) => {}
         }
     }
 }
@@ -1369,7 +1388,8 @@ mod tests {
     #[test]
     fn smooths_write_speed() {
         // First sample is instantaneous.
-        assert_eq!(smooth_speed(None, 1_000_000, 1.0), 1_000_000.0);
+        let instant = smooth_speed(None, 1_000_000, 1.0);
+        assert!((instant - 1_000_000.0).abs() < f64::EPSILON);
         // Later samples move only partway toward the new rate.
         let smoothed = smooth_speed(Some(1_000_000.0), 2_000_000, 1.0);
         let alpha = 1.0 - (-1.0_f64 / SPEED_TAU).exp();
@@ -1377,7 +1397,8 @@ mod tests {
         assert!((smoothed - expected).abs() < 1.0);
         assert!(smoothed > 1_000_000.0 && smoothed < 2_000_000.0);
         // A zero interval keeps the previous value.
-        assert_eq!(smooth_speed(Some(42.0), 999, 0.0), 42.0);
+        let kept = smooth_speed(Some(42.0), 999, 0.0);
+        assert!((kept - 42.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1467,17 +1488,10 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut last_destination = None;
 
-        let dir = resolve_workdir(
-            &archive,
-            &config,
-            &mut last_destination,
-            &answer_rx,
-            &event_tx,
-            0,
-            &cancel,
-            &ctx,
-        )
-        .unwrap();
+        let i18n = I18n::new(config.language);
+        let pid = Arc::new(AtomicU32::new(0));
+        let worker = test_worker(&config, &i18n, &event_tx, &answer_rx, &cancel, &pid, &ctx);
+        let dir = resolve_workdir(&archive, 0, &mut last_destination, &worker).unwrap();
 
         assert_eq!(dir, target);
         assert!(target.is_dir());
@@ -1498,17 +1512,12 @@ mod tests {
         let ctx = egui::Context::default();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let dir = prompt_destination(
-            &archive,
-            false,
-            base.clone(),
-            &answer_rx,
-            &event_tx,
-            0,
-            &cancel,
-            &ctx,
-        )
-        .unwrap();
+        let config = Config::default();
+        let i18n = I18n::new(config.language);
+        let pid = Arc::new(AtomicU32::new(0));
+        let worker = test_worker(&config, &i18n, &event_tx, &answer_rx, &cancel, &pid, &ctx);
+        let dir =
+            prompt_destination(&archive, PromptScope::Single, base.clone(), 0, &worker).unwrap();
 
         assert_eq!(dir, target);
         assert!(target.is_dir());
@@ -1531,17 +1540,10 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut last_destination = None;
 
-        let dir = resolve_workdir(
-            &archive,
-            &config,
-            &mut last_destination,
-            &answer_rx,
-            &event_tx,
-            0,
-            &cancel,
-            &ctx,
-        )
-        .unwrap();
+        let i18n = I18n::new(config.language);
+        let pid = Arc::new(AtomicU32::new(0));
+        let worker = test_worker(&config, &i18n, &event_tx, &answer_rx, &cancel, &pid, &ctx);
+        let dir = resolve_workdir(&archive, 0, &mut last_destination, &worker).unwrap();
 
         assert_eq!(dir, base);
         let _ = std::fs::remove_dir_all(&base);
@@ -1570,17 +1572,10 @@ mod tests {
         answer_tx
             .send(JobAnswer::Destination(chosen.clone()))
             .unwrap();
-        let dir = resolve_workdir(
-            &first,
-            &config,
-            &mut last_destination,
-            &answer_rx,
-            &event_tx,
-            0,
-            &cancel,
-            &ctx,
-        )
-        .unwrap();
+        let i18n = I18n::new(config.language);
+        let pid = Arc::new(AtomicU32::new(0));
+        let worker = test_worker(&config, &i18n, &event_tx, &answer_rx, &cancel, &pid, &ctx);
+        let dir = resolve_workdir(&first, 0, &mut last_destination, &worker).unwrap();
         assert_eq!(dir, chosen);
         let JobEvent::NeedDestination { suggested, .. } = event_rx.try_recv().unwrap() else {
             panic!("expected a destination request");
@@ -1590,17 +1585,7 @@ mod tests {
         answer_tx
             .send(JobAnswer::Destination(chosen.clone()))
             .unwrap();
-        let dir = resolve_workdir(
-            &second,
-            &config,
-            &mut last_destination,
-            &answer_rx,
-            &event_tx,
-            1,
-            &cancel,
-            &ctx,
-        )
-        .unwrap();
+        let dir = resolve_workdir(&second, 1, &mut last_destination, &worker).unwrap();
         assert_eq!(dir, chosen);
         let JobEvent::NeedDestination { suggested, .. } = event_rx.try_recv().unwrap() else {
             panic!("expected a destination request");
@@ -1615,7 +1600,7 @@ mod tests {
         assert_eq!(
             result_name(
                 Path::new("/tmp/PatreonTV-unsigned.zip"),
-                true,
+                ArchiveKind::Archive,
                 Some("PatreonTV-unsigned.ipa\n")
             ),
             None
@@ -1624,25 +1609,36 @@ mod tests {
         assert_eq!(
             result_name(
                 Path::new("/tmp/crispasr-linux-x86_64-hip.tar.gz"),
-                true,
+                ArchiveKind::Archive,
                 Some("crispasr-linux-x86_64-hip\n")
             ),
             None
         );
-        // Non-archive formats simply drop the compression extension.
+        // Single-file streams simply drop the compression extension.
         assert_eq!(
-            result_name(Path::new("/tmp/report.txt.gz"), false, None),
+            result_name(Path::new("/tmp/report.txt.gz"), ArchiveKind::Stream, None),
             None
         );
-        assert_eq!(result_name(Path::new("/tmp/file.gz"), false, None), None);
+        assert_eq!(
+            result_name(Path::new("/tmp/file.gz"), ArchiveKind::Stream, None),
+            None
+        );
         // Not obvious: the root has a genuinely different name.
         assert_eq!(
-            result_name(Path::new("/tmp/photos.zip"), true, Some("vacation/\n")),
+            result_name(
+                Path::new("/tmp/photos.zip"),
+                ArchiveKind::Archive,
+                Some("vacation/\n")
+            ),
             Some("vacation".to_string())
         );
         // Multiple roots are extracted into a folder named after the archive.
         assert_eq!(
-            result_name(Path::new("/tmp/a.zip"), true, Some("x\ny\n")),
+            result_name(
+                Path::new("/tmp/a.zip"),
+                ArchiveKind::Archive,
+                Some("x\ny\n")
+            ),
             None
         );
     }
@@ -1677,6 +1673,27 @@ mod tests {
         archive
     }
 
+    /// Wires a worker context around the locals a test already owns.
+    fn test_worker<'a>(
+        config: &'a Config,
+        i18n: &'a I18n,
+        events: &'a Sender<JobEvent>,
+        answers: &'a Receiver<JobAnswer>,
+        cancel: &'a Arc<AtomicBool>,
+        pid: &'a Arc<AtomicU32>,
+        ui: &'a egui::Context,
+    ) -> WorkerCtx<'a> {
+        WorkerCtx {
+            events,
+            ui,
+            answers,
+            cancel,
+            pid,
+            config,
+            i18n,
+        }
+    }
+
     /// Runs `process_one` with `answers` pre-queued, so a mistaken password
     /// prompt cannot hang the test. Returns the final event and every event
     /// the worker emitted.
@@ -1699,19 +1716,22 @@ mod tests {
         let current_pid = Arc::new(AtomicU32::new(0));
         let cancel_all = Arc::new(AtomicBool::new(false));
         let i18n = I18n::new(crate::i18n::Language::En);
+        let worker = WorkerCtx {
+            events: &event_tx,
+            ui: &ctx,
+            answers: &answer_rx,
+            cancel: &cancel_all,
+            pid: &current_pid,
+            config,
+            i18n: &i18n,
+        };
         let event = process_one(
             ouch,
             archive,
-            config,
-            &i18n,
+            0,
             &mut batch_password,
             &mut last_destination,
-            &answer_rx,
-            &event_tx,
-            0,
-            &current_pid,
-            &cancel_all,
-            &ctx,
+            &worker,
         );
         let events: Vec<JobEvent> = event_rx.try_iter().collect();
         (event, events)

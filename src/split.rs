@@ -79,8 +79,7 @@ pub fn kind(path: &Path) -> SplitKind {
     path.file_name()
         .and_then(|name| name.to_str())
         .and_then(parse_part_name)
-        .map(|part| part.kind)
-        .unwrap_or(SplitKind::None)
+        .map_or(SplitKind::None, |part| part.kind)
 }
 
 /// Every part of the split `path` belongs to, first volume first. A path that
@@ -192,8 +191,7 @@ fn kind_of(path: &Path) -> SplitKind {
     path.file_name()
         .and_then(|name| name.to_str())
         .and_then(parse_part_name)
-        .map(|part| part.kind)
-        .unwrap_or(SplitKind::None)
+        .map_or(SplitKind::None, |part| part.kind)
 }
 
 /// The volume number of `path` when it is a split part.

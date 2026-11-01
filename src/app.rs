@@ -1,6 +1,6 @@
 //! Application state and egui rendering.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -20,12 +20,59 @@ use crate::theme::{self, ThemeChoice};
 /// being joined and the archive is not being extracted yet.
 const JOINING_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 
+/// Failures and failed entries, so they stand out from the rest of the text.
+const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x30, 0x25);
+
 /// Tabs inside the settings window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
     Formats,
     Passwords,
+}
+
+/// Whether the status line reports a failure.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    #[default]
+    Info,
+    Error,
+}
+
+/// One-line status under the toolbar. Keeping the kind separate from the text
+/// lets the UI paint the "Error" prefix without hardcoding it in the message.
+#[derive(Debug, Default, Clone)]
+struct StatusLine {
+    text: String,
+    kind: StatusKind,
+}
+
+impl StatusLine {
+    /// A neutral message.
+    fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Info,
+        }
+    }
+
+    /// A failure; the UI prefixes it with a red "Error".
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Error,
+        }
+    }
+
+    /// Drops the message and resets the kind to neutral.
+    fn clear(&mut self) {
+        self.text.clear();
+        self.kind = StatusKind::Info;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
 }
 
 /// A secondary view, shown as a modal overlay inside the main window instead of
@@ -98,7 +145,7 @@ impl Status {
             Status::Pending => egui::Color32::GRAY,
             Status::Running => egui::Color32::from_rgb(0x2f, 0x80, 0xed),
             Status::Done => egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
-            Status::Failed => egui::Color32::from_rgb(0xd9, 0x30, 0x25),
+            Status::Failed => ERROR_COLOR,
             Status::Skipped => egui::Color32::from_rgb(0xc8, 0x8a, 0x00),
         }
     }
@@ -146,6 +193,10 @@ enum DirPickerTarget {
 }
 
 /// Root application.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent view flags; they become sub-states only when the UI grows"
+)]
 pub struct App {
     config: Config,
     i18n: I18n,
@@ -185,7 +236,7 @@ pub struct App {
     scale_dragging: bool,
     files: Vec<FileEntry>,
     log: Vec<String>,
-    status_line: String,
+    status_line: StatusLine,
     running: bool,
     controller: Option<JobController>,
     event_rx: Option<Receiver<JobEvent>>,
@@ -250,18 +301,38 @@ pub struct App {
     batch_started: Option<std::time::Instant>,
 }
 
+/// What the app shows once the window is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Startup {
+    /// Main view; extract the files passed on the command line, if any.
+    Extract,
+    /// Open the Settings overlay instead of extracting.
+    Settings,
+}
+
+/// When `flush_config` should write, since slider drags change many times a
+/// second and must not hit the disk each frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flush {
+    /// Skip the write when the last one happened less than 400 ms ago.
+    Debounced,
+    /// Write now, e.g. when the settings view or the window closes.
+    Forced,
+}
+
 impl App {
     /// Builds the app. When `initial_files` is non-empty the batch starts
     /// immediately (the double-click / "open with" flow).
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial_files: Vec<PathBuf>,
-        open_settings: bool,
+        startup: Startup,
     ) -> Self {
-        let config = Config::load();
+        let (config, config_warning) = Config::load();
         let i18n = I18n::new(config.language);
         theme::apply(&cc.egui_ctx, config.theme);
-        cc.egui_ctx.set_zoom_factor(config.ui_scale as f32 / 100.0);
+        cc.egui_ctx
+            .set_zoom_factor(ui_scale::zoom_factor(config.ui_scale));
 
         let (ouch, ouch_error) = match OuchClient::discover() {
             Ok(client) => (Some(client), None),
@@ -274,7 +345,7 @@ impl App {
         // AppImage manager already provides one.
         crate::association::remove_legacy_if_redundant();
 
-        let auto_close_on_success = !initial_files.is_empty() && !open_settings;
+        let auto_close_on_success = !initial_files.is_empty() && startup == Startup::Extract;
         let initial_scale = config.ui_scale;
         let destination_dir_input = config
             .destination_dir
@@ -288,7 +359,7 @@ impl App {
             ouch,
             ouch_error,
             logo,
-            view: if open_settings {
+            view: if startup == Startup::Settings {
                 Some(View::Settings)
             } else {
                 None
@@ -296,7 +367,7 @@ impl App {
             settings_tab: SettingsTab::General,
             saved_window_size: None,
             fit: None,
-            fit_needed: open_settings,
+            fit_needed: startup == Startup::Settings,
             applied_scale: initial_scale,
             update_status: None,
             update_rx: None,
@@ -307,7 +378,7 @@ impl App {
             scale_dragging: false,
             files: Vec::new(),
             log: Vec::new(),
-            status_line: String::new(),
+            status_line: StatusLine::default(),
             running: false,
             controller: None,
             event_rx: None,
@@ -342,8 +413,14 @@ impl App {
             batch_started: None,
         };
 
+        // A corrupt config must be visible: stderr goes nowhere in an AppImage.
+        if let Some(warning) = config_warning {
+            app.status_line = StatusLine::error(warning.clone());
+            app.push_log(warning);
+        }
+
         for path in initial_files {
-            let _ = app.add_file(path);
+            let _ = app.add_file(&path);
         }
         if !app.files.is_empty() {
             app.request_start_batch(&cc.egui_ctx);
@@ -374,8 +451,7 @@ impl App {
             .filter(|(_, file)| file.status == Status::Pending)
             .filter(|(_, file)| {
                 formats::outer_format(&file.path)
-                    .map(|format| self.config.is_format_disabled(format.id))
-                    .unwrap_or(false)
+                    .is_some_and(|format| self.config.is_format_disabled(format.id))
             })
             .map(|(index, _)| index)
             .collect();
@@ -403,7 +479,7 @@ impl App {
             return;
         }
         let Some(ouch) = self.ouch.clone() else {
-            self.status_line = self.i18n.t("ouch.not_found");
+            self.status_line = StatusLine::info(self.i18n.t("ouch.not_found"));
             return;
         };
 
@@ -484,7 +560,7 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        let pid_slot = self.picker_pid.clone();
+        let pid_slot = Arc::clone(&self.picker_pid);
         thread::spawn(move || {
             let files = crate::system::pick_files(&pid_slot);
             if tx.send(files).is_ok() {
@@ -517,7 +593,7 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        let pid_slot = self.picker_pid.clone();
+        let pid_slot = Arc::clone(&self.picker_pid);
         thread::spawn(move || {
             let dir = crate::system::pick_directory(&pid_slot);
             if tx.send(dir).is_ok() {
@@ -572,7 +648,7 @@ impl App {
                 self.write_speed = 0;
                 self.eta_secs = 0;
                 self.joining = false;
-                self.status_line = self.i18n.t("extract.working");
+                self.status_line = StatusLine::info(self.i18n.t("extract.working"));
             }
             JobEvent::Log { index, line } => {
                 let _ = index;
@@ -663,7 +739,7 @@ impl App {
                     } else {
                         Status::Failed
                     };
-                    file.message = message.clone();
+                    file.message.clone_from(&message);
 
                     if !success && !skipped {
                         let name = self.file_name(file_index);
@@ -699,7 +775,7 @@ impl App {
                 self.joining = false;
                 self.batch_started = None;
                 self.confirm_close = false;
-                self.status_line = self.i18n.t("extract.all_done");
+                self.status_line = StatusLine::info(self.i18n.t("extract.all_done"));
 
                 let done = self
                     .files
@@ -786,8 +862,8 @@ impl App {
     /// multi-volume set the first volume is stored, so the set is queued only
     /// once regardless of which part was passed in. Returns the stored path
     /// when it was added.
-    fn add_file(&mut self, path: PathBuf) -> Option<PathBuf> {
-        let parts = crate::split::archive_parts(&path);
+    fn add_file(&mut self, path: &Path) -> Option<PathBuf> {
+        let parts = crate::split::archive_parts(path);
         let primary = parts.first()?.clone();
         if self.files.iter().any(|file| file.path == primary) {
             return None;
@@ -806,7 +882,7 @@ impl App {
     fn add_files_and_extract(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         let mut added = false;
         for path in paths {
-            if let Some(stored) = self.add_file(path) {
+            if let Some(stored) = self.add_file(&path) {
                 self.push_log(format!("+ {}", stored.display()));
                 added = true;
             }
@@ -827,8 +903,8 @@ impl App {
     }
 
     /// Writes the config if there are pending changes and enough time passed
-    /// since the last write (or `force` is set).
-    fn flush_config(&mut self, force: bool) {
+    /// since the last write (or the flush is forced).
+    fn flush_config(&mut self, urgency: Flush) {
         if !self.config_dirty {
             return;
         }
@@ -836,7 +912,7 @@ impl App {
         let due = self
             .last_config_save
             .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_millis(400));
-        if !force && !due {
+        if urgency == Flush::Debounced && !due {
             return;
         }
         self.last_config_save = Some(now);
@@ -844,7 +920,7 @@ impl App {
         if let Err(err) = self.config.save() {
             // Keep the change pending so a later flush can retry the write.
             self.config_dirty = true;
-            self.status_line = format!("{}: {err}", self.i18n.t("common.error"));
+            self.status_line = StatusLine::error(err.to_string());
         }
     }
 
@@ -940,7 +1016,7 @@ impl eframe::App for App {
         // expensive (font atlas + relayout), so while the slider is dragged we
         // wait until it is released.
         if !self.scale_dragging && self.applied_scale != self.config.ui_scale {
-            ctx.set_zoom_factor(self.config.ui_scale as f32 / 100.0);
+            ctx.set_zoom_factor(ui_scale::zoom_factor(self.config.ui_scale));
             self.applied_scale = self.config.ui_scale;
         }
 
@@ -972,7 +1048,7 @@ impl eframe::App for App {
 
         // A confirmed close always wins, so it never gets intercepted again.
         if self.close_requested {
-            self.flush_config(true);
+            self.flush_config(Flush::Forced);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -984,7 +1060,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.confirm_close = true;
             } else {
-                self.flush_config(true);
+                self.flush_config(Flush::Forced);
             }
         }
 
@@ -1020,7 +1096,7 @@ impl eframe::App for App {
         }
 
         // Persist any pending settings change (debounced).
-        self.flush_config(false);
+        self.flush_config(Flush::Debounced);
         if self.config_dirty {
             ctx.request_repaint_after(std::time::Duration::from_millis(400));
         }
@@ -1069,12 +1145,26 @@ impl App {
     fn ui_extract(&mut self, ui: &mut egui::Ui) {
         if self.ouch.is_none() {
             let error = self.ouch_error.clone().unwrap_or_default();
-            ui.colored_label(egui::Color32::from_rgb(0xd9, 0x30, 0x25), error);
+            ui.colored_label(ERROR_COLOR, error);
             ui.label(self.i18n.t("ouch.not_found_hint"));
         }
 
         if !self.running && !self.status_line.is_empty() {
-            ui.label(self.status_line.clone());
+            match self.status_line.kind {
+                StatusKind::Info => {
+                    ui.label(self.status_line.text.clone());
+                }
+                StatusKind::Error => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(self.i18n.t("common.error"))
+                                .strong()
+                                .color(ERROR_COLOR),
+                        );
+                        ui.label(self.status_line.text.clone());
+                    });
+                }
+            }
         }
 
         if self.files.is_empty() {
@@ -1155,10 +1245,10 @@ impl App {
                                 None
                             };
                             let shown = current.map_or(&file.path, |(_, part)| part);
-                            let name = shown
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| shown.display().to_string());
+                            let name = shown.file_name().map_or_else(
+                                || shown.display().to_string(),
+                                |name| name.to_string_lossy().into_owned(),
+                            );
                             ui.label(name).on_hover_text(shown.display().to_string());
                             if let Some((part_index, _)) = current {
                                 ui.label(
@@ -1197,7 +1287,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new(&file.message)
                                         .small()
-                                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
+                                        .color(ERROR_COLOR),
                                 );
                             }
                             ui.with_layout(
@@ -1241,8 +1331,10 @@ impl App {
                                                 file.path
                                                     .parent()
                                                     .filter(|parent| !parent.as_os_str().is_empty())
-                                                    .map(PathBuf::from)
-                                                    .unwrap_or_else(|| PathBuf::from(".")),
+                                                    .map_or_else(
+                                                        || PathBuf::from("."),
+                                                        PathBuf::from,
+                                                    ),
                                             );
                                         }
                                     }
@@ -1293,20 +1385,17 @@ impl App {
         if view == View::Settings {
             self.bulk_password_open = false;
         }
-        self.flush_config(true);
+        self.flush_config(Flush::Forced);
         self.fit = None;
         self.fit_needed = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(crate::WINDOW_TITLE.to_owned()));
 
         let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
         if !maximized {
-            let size = self
-                .saved_window_size
-                .take()
-                .map(|pixels| pixels / ctx.pixels_per_point())
-                .unwrap_or_else(|| {
-                    egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
-                });
+            let size = self.saved_window_size.take().map_or_else(
+                || egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1]),
+                |pixels| pixels / ctx.pixels_per_point(),
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
         ctx.request_repaint();
@@ -1656,7 +1745,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(self.i18n.t("destination.not_set"))
                         .small()
-                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
+                        .color(ERROR_COLOR),
                 );
             }
         }
@@ -1773,7 +1862,7 @@ impl App {
 
         ui.add_space(12.0);
         ui.label(egui::RichText::new(self.i18n.t("settings.ui_scale")).strong());
-        let mut scale = self.config.ui_scale as f32;
+        let mut scale = ui_scale::percent_value(self.config.ui_scale);
         let response = ui.add(
             egui::Slider::new(&mut scale, 75.0..=200.0)
                 .suffix("%")
@@ -1781,7 +1870,7 @@ impl App {
         );
         self.scale_dragging = response.dragged();
         if response.changed() {
-            self.config.ui_scale = scale.round() as u32;
+            self.config.ui_scale = ui_scale::from_percent_value(scale);
             self.persist();
         }
 
@@ -1882,10 +1971,8 @@ impl App {
                     };
                 }
                 if ui.button(self.i18n.t("settings.desktop.remove")).clicked() {
-                    self.association_status = match crate::association::remove_desktop() {
-                        Ok(()) => self.i18n.t("settings.desktop.removed"),
-                        Err(err) => format!("{}: {err}", self.i18n.t("common.error")),
-                    };
+                    crate::association::remove_desktop();
+                    self.association_status = self.i18n.t("settings.desktop.removed");
                 }
             });
         }
@@ -2074,11 +2161,10 @@ impl App {
         let Some(prompt) = self.password_prompt.as_ref() else {
             return;
         };
-        let name = prompt
-            .archive
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| prompt.archive.display().to_string());
+        let name = prompt.archive.file_name().map_or_else(
+            || prompt.archive.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         let error = prompt.error.clone();
         let index = prompt.index;
 
@@ -2094,11 +2180,7 @@ impl App {
             );
             // Only shown after a submitted password failed.
             if let Some(error) = &error {
-                ui.label(
-                    egui::RichText::new(error)
-                        .small()
-                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
-                );
+                ui.label(egui::RichText::new(error).small().color(ERROR_COLOR));
             }
             ui.add_space(4.0);
             ui.label(self.i18n.t("password.prompt"));
@@ -2182,7 +2264,7 @@ impl App {
             self.start_batch(&ctx);
         } else if cancel {
             self.confirm_disabled = None;
-            self.status_line = self.i18n.t("confirm_disabled.cancelled");
+            self.status_line = StatusLine::info(self.i18n.t("confirm_disabled.cancelled"));
         }
     }
 
@@ -2221,11 +2303,10 @@ impl App {
             return;
         };
         let batch = prompt.batch;
-        let archive_name = prompt
-            .archive
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| prompt.archive.display().to_string());
+        let archive_name = prompt.archive.file_name().map_or_else(
+            || prompt.archive.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         let error = prompt.error.clone();
         let file_index = prompt.index;
 
@@ -2248,11 +2329,7 @@ impl App {
             };
             ui.label(body);
             if let Some(error) = &error {
-                ui.label(
-                    egui::RichText::new(error)
-                        .small()
-                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
-                );
+                ui.label(egui::RichText::new(error).small().color(ERROR_COLOR));
             }
             ui.add_space(4.0);
             ui.label(self.i18n.t("destination.folder"));
@@ -2378,10 +2455,7 @@ impl App {
             let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
             ui.set_min_width(max_width.min(420.0));
             ui.set_max_width(max_width);
-            ui.heading(
-                egui::RichText::new(self.i18n.t("common.error"))
-                    .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
-            );
+            ui.heading(egui::RichText::new(self.i18n.t("common.error")).color(ERROR_COLOR));
             egui::ScrollArea::vertical()
                 .id_salt("error-scroll")
                 .max_height(260.0)
@@ -2424,6 +2498,33 @@ impl App {
     }
 }
 
+/// Numeric conversions for the UI scale.
+///
+/// The config stores a percentage as `u32` and egui works in `f32`, so `as` is
+/// the only bridge available. Keeping it here documents why it is safe.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the scale is clamped to 75..=200, so every conversion is exact"
+)]
+mod ui_scale {
+    /// Slider value (`75.0..=200.0`) for a stored percentage.
+    pub fn percent_value(percent: u32) -> f32 {
+        percent as f32
+    }
+
+    /// egui zoom factor (`1.0` = 100 %) for a stored percentage.
+    pub fn zoom_factor(percent: u32) -> f32 {
+        percent as f32 / 100.0
+    }
+
+    /// Stored percentage for a slider value.
+    pub fn from_percent_value(value: f32) -> u32 {
+        value.round() as u32
+    }
+}
+
 /// Formats a number of seconds as `M:SS`.
 fn format_duration(total_secs: u64) -> String {
     let minutes = total_secs / 60;
@@ -2432,6 +2533,10 @@ fn format_duration(total_secs: u64) -> String {
 }
 
 /// Formats a byte-per-second rate as `B/s`, `KB/s`, `MB/s` or `GB/s`.
+#[expect(
+    clippy::as_conversions,
+    reason = "display-only rate; `f64::from` does not cover u64"
+)]
 fn format_speed(bytes_per_sec: u64) -> String {
     const KIB: f64 = 1024.0;
     let bytes = bytes_per_sec as f64;
@@ -2462,7 +2567,10 @@ fn window_size(ctx: &egui::Context) -> Option<egui::Vec2> {
 fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let image = image::load_from_memory_with_format(LOGO_PNG, image::ImageFormat::Png).ok()?;
     let rgba = image.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
+    let size = [
+        usize::try_from(rgba.width()).expect("image width fits in usize"),
+        usize::try_from(rgba.height()).expect("image height fits in usize"),
+    ];
     let pixels = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
     Some(ctx.load_texture("app-logo", pixels, egui::TextureOptions::LINEAR))
 }

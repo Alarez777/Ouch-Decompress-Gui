@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::formats::ArchiveKind;
+
 /// User-configurable extraction strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -24,7 +26,7 @@ impl DecompressMode {
     ];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             DecompressMode::Folder => "mode.folder",
             DecompressMode::Here => "mode.here",
@@ -33,7 +35,7 @@ impl DecompressMode {
     }
 
     /// Translation key for the explanation shown under the option.
-    pub fn hint_key(&self) -> &'static str {
+    pub fn hint_key(self) -> &'static str {
         match self {
             DecompressMode::Folder => "mode.folder.hint",
             DecompressMode::Here => "mode.here.hint",
@@ -67,7 +69,7 @@ impl DestinationMode {
     ];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             DestinationMode::ArchiveFolder => "destination.archive_folder",
             DestinationMode::Fixed => "destination.fixed",
@@ -77,7 +79,7 @@ impl DestinationMode {
     }
 
     /// Translation key for the explanation shown under the option.
-    pub fn hint_key(&self) -> &'static str {
+    pub fn hint_key(self) -> &'static str {
         match self {
             DestinationMode::ArchiveFolder => "destination.archive_folder.hint",
             DestinationMode::Fixed => "destination.fixed.hint",
@@ -135,10 +137,10 @@ pub fn roots_from_listing(output: &str) -> Vec<String> {
 
 /// Decides the concrete target for one archive.
 ///
-/// * Non-archive single-file formats (`gz`, `xz`, ...) always extract here.
+/// * Single-file streams (`gz`, `xz`, ...) always extract here.
 /// * In smart mode, more than one root entry means a folder is warranted.
-pub fn choose_target(mode: DecompressMode, is_archive: bool, roots: &[String]) -> Target {
-    if !is_archive {
+pub fn choose_target(mode: DecompressMode, kind: ArchiveKind, roots: &[String]) -> Target {
+    if !kind.is_archive() {
         return Target::Here;
     }
     match mode {
@@ -204,7 +206,7 @@ mod tests {
         let roots = roots_from_listing("Def Jam Fight for NY ESP.iso\n");
         assert_eq!(roots, vec!["Def Jam Fight for NY ESP.iso".to_string()]);
         assert_eq!(
-            choose_target(DecompressMode::Smart, true, &roots),
+            choose_target(DecompressMode::Smart, ArchiveKind::Archive, &roots),
             Target::Here
         );
     }
@@ -212,19 +214,31 @@ mod tests {
     #[test]
     fn smart_mode_picks_target() {
         assert_eq!(
-            choose_target(DecompressMode::Smart, true, &["only".into()]),
+            choose_target(
+                DecompressMode::Smart,
+                ArchiveKind::Archive,
+                &["only".into()]
+            ),
             Target::Here
         );
         assert_eq!(
-            choose_target(DecompressMode::Smart, true, &["a".into(), "b".into()]),
+            choose_target(
+                DecompressMode::Smart,
+                ArchiveKind::Archive,
+                &["a".into(), "b".into()]
+            ),
             Target::Folder
         );
         assert_eq!(
-            choose_target(DecompressMode::Smart, false, &["a".into(), "b".into()]),
+            choose_target(
+                DecompressMode::Smart,
+                ArchiveKind::Stream,
+                &["a".into(), "b".into()]
+            ),
             Target::Here
         );
         assert_eq!(
-            choose_target(DecompressMode::Folder, false, &[]),
+            choose_target(DecompressMode::Folder, ArchiveKind::Stream, &[]),
             Target::Here
         );
     }

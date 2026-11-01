@@ -21,7 +21,7 @@ impl Language {
     pub const ALL: [Language; 3] = [Language::System, Language::En, Language::Es];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             Language::System => "language.system",
             Language::En => "language.en",

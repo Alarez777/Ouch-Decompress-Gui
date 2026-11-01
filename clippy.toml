@@ -1,0 +1,11 @@
+# BeautifulRust clippy configuration (https://github.com/morganlinton/BeautifulRust).
+# Works together with the `[lints]` table in `Cargo.toml`.
+
+# A bool argument is unreadable at the call site (`report(true)`) and cannot grow
+# a third mode; use a two-variant enum or two methods instead.
+max-fn-params-bools = 0
+
+# Tests are allowed to panic and print: that is how they assert and diagnose.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
