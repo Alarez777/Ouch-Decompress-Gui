@@ -32,9 +32,16 @@ AppImage.
 - Extract archives by double-clicking them, or by opening several at once
   (native file-manager integration).
 - Multiple extraction strategies:
-  - **Always create a folder** named after the archive.
-  - **Always extract here** (into the archive's folder).
-  - **Smart**: create a folder only when the archive has multiple root entries.
+  - **Always create a subdirectory** named after the archive.
+  - **Always extract into the root of the source directory**.
+  - **Smart**: create a directory only when the archive has multiple root
+    entries.
+- Configurable extraction destination:
+  - **Next to the archive file** (default).
+  - **In a specific directory** chosen in the settings.
+  - **Ask when the batch starts**, once for every archive in the batch.
+  - **Ask for every file**, before extracting each archive.
+  The extraction strategy above is applied inside the chosen destination.
 - Password handling: saved passwords are tried automatically, otherwise the
   app prompts and reuses the first working password for the whole batch. The
   prompt only shows an error after a wrong password.
@@ -47,7 +54,7 @@ AppImage.
   default handler in one click.
 - Desktop notifications when a batch finishes, including the resulting name
   when it is not obvious from the archive (for example
-  `photos.zip -> vacation`), plus an "Open folder" shortcut per file.
+  `photos.zip -> vacation`), plus an "Open directory" shortcut per file.
 - Dedicated Log view with copy-to-clipboard, and errors shown in a popup.
 - Add files with the **Add file** button (native file picker).
 - Settings in their own view, split into **General**, **Formats** and
@@ -92,8 +99,8 @@ runs the bundled `ouch` executable as a subprocess:
 - `ouch list -A -q <archive>` is used to validate passwords and to drive the
   **Smart** extraction mode (it counts the archive's root entries).
 - `ouch decompress` performs the actual extraction, using either the native
-  stem-folder behavior or `--here`, always relative to the archive's parent
-  directory.
+  stem-named directory behavior or `--here`, relative to the selected
+  destination (the archive's parent directory by default).
 - Passwords are passed with `-p`; `ouch` never prompts on its own.
 
 ## Building

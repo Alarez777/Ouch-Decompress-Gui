@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::i18n::Language;
-use crate::modes::DecompressMode;
+use crate::modes::{DecompressMode, DestinationMode};
 use crate::theme::ThemeChoice;
 
 /// Directory name used under the user's config dir.
@@ -162,6 +162,10 @@ pub struct Config {
     pub version: u32,
     /// How archives should be unpacked.
     pub decompress_mode: DecompressMode,
+    /// Where archives should be unpacked.
+    pub destination_mode: DestinationMode,
+    /// Base directory used by [`DestinationMode::Fixed`].
+    pub destination_dir: Option<PathBuf>,
     /// Passwords tried automatically, in order. Stored in plain text on
     /// purpose; the UI warns the user about this.
     pub passwords: Vec<String>,
@@ -224,6 +228,8 @@ impl Default for Config {
         Self {
             version: 1,
             decompress_mode: DecompressMode::Smart,
+            destination_mode: DestinationMode::ArchiveFolder,
+            destination_dir: None,
             passwords: Vec::new(),
             password_sort: PasswordSort::Alphabetical,
             disabled_formats: Vec::new(),
@@ -318,6 +324,8 @@ mod tests {
             conflict_policy: ConflictPolicy::Rename,
             after_extract: AfterExtract::Keep,
             trash_fallback: TrashFallback::Nothing,
+            destination_mode: DestinationMode::Fixed,
+            destination_dir: Some(PathBuf::from("/tmp/extracted")),
             ui_scale: 150,
             passwords: vec!["secret".into()],
             ..Config::default()
@@ -329,6 +337,11 @@ mod tests {
         assert_eq!(loaded.conflict_policy, ConflictPolicy::Rename);
         assert_eq!(loaded.after_extract, AfterExtract::Keep);
         assert_eq!(loaded.trash_fallback, TrashFallback::Nothing);
+        assert_eq!(loaded.destination_mode, DestinationMode::Fixed);
+        assert_eq!(
+            loaded.destination_dir,
+            Some(PathBuf::from("/tmp/extracted"))
+        );
         assert_eq!(loaded.ui_scale, 150);
         assert_eq!(loaded.passwords, vec!["secret".to_string()]);
 
@@ -354,6 +367,19 @@ mod tests {
     fn notifications_default_to_on_failure() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.notifications, Notifications::OnFailure);
+    }
+
+    #[test]
+    fn destination_defaults_to_archive_folder() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.destination_mode, DestinationMode::ArchiveFolder);
+        assert_eq!(config.destination_dir, None);
+    }
+
+    #[test]
+    fn round_trips_destination_mode() {
+        let config: Config = serde_json::from_str(r#"{"destination_mode": "ask_each"}"#).unwrap();
+        assert_eq!(config.destination_mode, DestinationMode::AskEach);
     }
 
     #[test]

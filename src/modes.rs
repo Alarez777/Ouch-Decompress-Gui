@@ -42,6 +42,51 @@ impl DecompressMode {
     }
 }
 
+/// User-configurable base directory for extraction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DestinationMode {
+    /// Extract next to each archive (the historical behavior).
+    #[default]
+    ArchiveFolder,
+    /// Extract into a directory chosen in the settings.
+    Fixed,
+    /// Ask for a directory once when a batch starts.
+    AskBatch,
+    /// Ask for a directory for every archive.
+    AskEach,
+}
+
+impl DestinationMode {
+    /// All variants in presentation order.
+    pub const ALL: [DestinationMode; 4] = [
+        DestinationMode::ArchiveFolder,
+        DestinationMode::Fixed,
+        DestinationMode::AskBatch,
+        DestinationMode::AskEach,
+    ];
+
+    /// Translation key for the label.
+    pub fn label_key(&self) -> &'static str {
+        match self {
+            DestinationMode::ArchiveFolder => "destination.archive_folder",
+            DestinationMode::Fixed => "destination.fixed",
+            DestinationMode::AskBatch => "destination.ask_batch",
+            DestinationMode::AskEach => "destination.ask_each",
+        }
+    }
+
+    /// Translation key for the explanation shown under the option.
+    pub fn hint_key(&self) -> &'static str {
+        match self {
+            DestinationMode::ArchiveFolder => "destination.archive_folder.hint",
+            DestinationMode::Fixed => "destination.fixed.hint",
+            DestinationMode::AskBatch => "destination.ask_batch.hint",
+            DestinationMode::AskEach => "destination.ask_each.hint",
+        }
+    }
+}
+
 /// Concrete decision for a single archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {

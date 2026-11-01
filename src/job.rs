@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
 use crate::formats;
 use crate::i18n::I18n;
-use crate::modes::{self, DecompressMode, Target};
+use crate::modes::{self, DecompressMode, DestinationMode, Target};
 use crate::multivolume;
 use crate::ouch::OuchClient;
 use crate::split;
@@ -43,6 +43,16 @@ pub enum JobEvent {
     NeedOverwrite {
         index: usize,
         conflicts: Vec<PathBuf>,
+    },
+    /// The worker needs a destination directory (configured to ask per batch
+    /// or per file). `batch` is true when the answer applies to the whole
+    /// batch. `error` is set when a previously submitted path was invalid.
+    NeedDestination {
+        index: usize,
+        archive: PathBuf,
+        batch: bool,
+        suggested: PathBuf,
+        error: Option<String>,
     },
     /// The worker is preparing an archive before extracting it (joining the
     /// parts of a split) or has finished preparing. The UI shows this phase
@@ -91,6 +101,8 @@ pub enum JobAnswer {
     CancelBatch,
     /// Extract anyway, overwriting existing files.
     Overwrite,
+    /// Directory chosen for a destination prompt.
+    Destination(PathBuf),
 }
 
 /// Handle used by the UI to answer prompts and cancel the batch.
@@ -155,6 +167,9 @@ fn run(
 ) {
     // Password remembered from the first successful prompt, reused afterwards.
     let mut batch_password: Option<String> = None;
+    // Last directory chosen by a prompt: the batch destination in
+    // `DestinationMode::AskBatch`, or the previous archive's in `AskEach`.
+    let mut last_destination: Option<PathBuf> = None;
 
     for (index, archive) in archives.iter().enumerate() {
         if cancel_all.load(Ordering::Relaxed) {
@@ -168,6 +183,7 @@ fn run(
             &config,
             &i18n,
             &mut batch_password,
+            &mut last_destination,
             &answer_rx,
             &event_tx,
             index,
@@ -188,6 +204,7 @@ fn process_one(
     config: &Config,
     i18n: &I18n,
     batch_password: &mut Option<String>,
+    last_destination: &mut Option<PathBuf>,
     answer_rx: &Receiver<JobAnswer>,
     event_tx: &Sender<JobEvent>,
     index: usize,
@@ -281,8 +298,26 @@ fn process_one(
         Ok(None) => return fail(index, "cancelled".into()),
         Err(err) => return fail(index, err.to_string()),
     };
-    let source = prepared.path();
-    let workdir = parent_dir(archive);
+    let source = absolute(prepared.path());
+    let workdir = match resolve_workdir(
+        archive,
+        config,
+        last_destination,
+        answer_rx,
+        event_tx,
+        index,
+        cancel_all,
+        ctx,
+    ) {
+        Ok(workdir) => workdir,
+        Err(message) => return fail(index, message),
+    };
+    log_line(
+        event_tx,
+        ctx,
+        index,
+        format!("destination: {}", workdir.display()),
+    );
 
     let is_archive = formats::is_archive_path(archive);
 
@@ -300,17 +335,17 @@ fn process_one(
     }
 
     // Non-archive formats (gz, xz, zst, ...) hold a single file and never
-    // need a password; unpack straight into the parent directory. The
+    // need a password; unpack straight into the destination directory. The
     // configured conflict policy still applies to the produced file.
     if !is_archive {
-        let conflicts = detect_single_file_conflict(archive);
+        let conflicts = detect_single_file_conflict(archive, &workdir);
         if let Err(message) =
             apply_conflict_policy(&conflicts, config, answer_rx, event_tx, ctx, index)
         {
             return fail(index, message);
         }
         let result = result_name(archive, false, None);
-        return match ouch.decompress(source, &workdir, Target::Here, None, current_pid, &log) {
+        return match ouch.decompress(&source, &workdir, Target::Here, None, current_pid, &log) {
             Ok(outcome) if outcome.success => finish_success(
                 index,
                 archive,
@@ -339,7 +374,7 @@ fn process_one(
 
     match obtain_listing(
         ouch,
-        source,
+        &source,
         config,
         batch_password,
         answer_rx,
@@ -380,7 +415,7 @@ fn process_one(
 
     // Handle existing destinations according to the configured policy.
     if let Some(text) = &listing {
-        let conflicts = detect_conflicts(archive, target, text);
+        let conflicts = detect_conflicts(archive, target, text, &workdir);
         if let Err(message) =
             apply_conflict_policy(&conflicts, config, answer_rx, event_tx, ctx, index)
         {
@@ -424,7 +459,7 @@ fn process_one(
             return fail(index, "cancelled".into());
         }
         match ouch.decompress(
-            source,
+            &source,
             &workdir,
             target,
             candidate.as_deref(),
@@ -482,8 +517,14 @@ fn process_one(
         first_prompt = false;
         match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
             JobAnswer::Password(password) => {
-                match ouch.decompress(source, &workdir, target, Some(&password), current_pid, &log)
-                {
+                match ouch.decompress(
+                    &source,
+                    &workdir,
+                    target,
+                    Some(&password),
+                    current_pid,
+                    &log,
+                ) {
                     Ok(outcome) if outcome.success => {
                         *batch_password = Some(password);
                         return finish_success(
@@ -508,12 +549,121 @@ fn process_one(
             }
             JobAnswer::Skip => return fail(index, "skipped".into()),
             JobAnswer::CancelBatch => return fail(index, "cancelled".into()),
-            JobAnswer::Overwrite => continue,
+            JobAnswer::Overwrite | JobAnswer::Destination(_) => continue,
         }
     }
 }
 
-/// Directory the extracted files are written into (the archive's parent).
+/// Resolves the base directory used for this archive and creates it when needed.
+#[allow(clippy::too_many_arguments)]
+fn resolve_workdir(
+    archive: &Path,
+    config: &Config,
+    last_destination: &mut Option<PathBuf>,
+    answer_rx: &Receiver<JobAnswer>,
+    event_tx: &Sender<JobEvent>,
+    index: usize,
+    cancel_all: &Arc<AtomicBool>,
+    ctx: &egui::Context,
+) -> Result<PathBuf, String> {
+    let suggested = last_destination
+        .clone()
+        .unwrap_or_else(|| absolute(&parent_dir(archive)));
+    let dir = match config.destination_mode {
+        DestinationMode::ArchiveFolder => return Ok(suggested),
+        DestinationMode::Fixed => match config.destination_dir.as_deref() {
+            Some(dir) if !dir.as_os_str().is_empty() => absolute(dir),
+            _ => return Err("no destination folder configured in settings".into()),
+        },
+        DestinationMode::AskBatch => match last_destination.as_ref() {
+            Some(dir) => dir.clone(),
+            None => {
+                let dir = prompt_destination(
+                    archive, true, suggested, answer_rx, event_tx, index, cancel_all, ctx,
+                )?;
+                *last_destination = Some(dir.clone());
+                return Ok(dir);
+            }
+        },
+        DestinationMode::AskEach => {
+            let dir = prompt_destination(
+                archive, false, suggested, answer_rx, event_tx, index, cancel_all, ctx,
+            )?;
+            *last_destination = Some(dir.clone());
+            return Ok(dir);
+        }
+    };
+    ensure_directory(dir)
+}
+
+/// Blocks the worker until the UI supplies a destination directory.
+#[allow(clippy::too_many_arguments)]
+fn prompt_destination(
+    archive: &Path,
+    batch: bool,
+    suggested: PathBuf,
+    answer_rx: &Receiver<JobAnswer>,
+    event_tx: &Sender<JobEvent>,
+    index: usize,
+    cancel_all: &Arc<AtomicBool>,
+    ctx: &egui::Context,
+) -> Result<PathBuf, String> {
+    let mut suggested = suggested;
+    let mut last_error: Option<String> = None;
+    loop {
+        if cancel_all.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let _ = send(
+            event_tx,
+            ctx,
+            JobEvent::NeedDestination {
+                index,
+                archive: archive.to_path_buf(),
+                batch,
+                suggested: suggested.clone(),
+                error: last_error.take(),
+            },
+        );
+        match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
+            JobAnswer::Destination(path) => {
+                if path.as_os_str().is_empty() {
+                    last_error = Some("the destination folder is empty".into());
+                    continue;
+                }
+                let dir = absolute(&path);
+                match ensure_directory(dir.clone()) {
+                    Ok(dir) => return Ok(dir),
+                    Err(err) => {
+                        suggested = dir;
+                        last_error = Some(err);
+                    }
+                }
+            }
+            JobAnswer::Skip => return Err("skipped".into()),
+            JobAnswer::CancelBatch => return Err("cancelled".into()),
+            JobAnswer::Password(_) | JobAnswer::Overwrite => continue,
+        }
+    }
+}
+
+/// Creates `dir` if needed, then confirms it is a directory.
+fn ensure_directory(dir: PathBuf) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(&dir).map_err(|err| format!("creating {}: {err}", dir.display()))?;
+    if dir.is_dir() {
+        Ok(dir)
+    } else {
+        Err(format!("not a directory: {}", dir.display()))
+    }
+}
+
+/// Makes a path absolute without resolving symlinks, so it keeps working after
+/// `ouch` changes its working directory.
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Directory that contains the archive (the default extraction destination).
 fn parent_dir(archive: &Path) -> PathBuf {
     archive
         .parent()
@@ -534,19 +684,17 @@ fn is_safe_relative_component(name: &str) -> bool {
 }
 
 /// Returns the destination paths that already exist and would be overwritten.
-fn detect_conflicts(archive: &Path, target: Target, listing: &str) -> Vec<PathBuf> {
-    let parent = parent_dir(archive);
-
+fn detect_conflicts(archive: &Path, target: Target, listing: &str, workdir: &Path) -> Vec<PathBuf> {
     match target {
         Target::Folder => {
             let stem = formats::stem_without_known_extensions(archive);
             // A hidden archive (`.zip`) or a non-UTF-8 name yields an empty
-            // stem; joining it would make the parent itself the destination and
+            // stem; joining it would make the workdir itself the destination and
             // could rename a whole directory, so bail out.
             if stem.is_empty() {
                 return Vec::new();
             }
-            let destination = parent.join(stem);
+            let destination = workdir.join(stem);
             let non_empty = destination
                 .read_dir()
                 .map(|mut entries| entries.next().is_some())
@@ -560,19 +708,19 @@ fn detect_conflicts(archive: &Path, target: Target, listing: &str) -> Vec<PathBu
         Target::Here => modes::roots_from_listing(listing)
             .into_iter()
             .filter(|root| is_safe_relative_component(root))
-            .map(|root| parent.join(root))
+            .map(|root| workdir.join(root))
             .filter(|path| path.exists())
             .collect(),
     }
 }
 
 /// Returns the output file of a single-file format when it already exists.
-fn detect_single_file_conflict(archive: &Path) -> Vec<PathBuf> {
+fn detect_single_file_conflict(archive: &Path, workdir: &Path) -> Vec<PathBuf> {
     let stem = formats::stem_without_known_extensions(archive);
     if stem.is_empty() {
         return Vec::new();
     }
-    let destination = parent_dir(archive).join(stem);
+    let destination = workdir.join(stem);
     if destination.exists() {
         vec![destination]
     } else {
@@ -622,7 +770,7 @@ fn apply_conflict_policy(
                     JobAnswer::Overwrite => return Ok(()),
                     JobAnswer::Skip => return Err("skipped".into()),
                     JobAnswer::CancelBatch => return Err("cancelled".into()),
-                    JobAnswer::Password(_) => continue,
+                    JobAnswer::Password(_) | JobAnswer::Destination(_) => continue,
                 }
             }
         }
@@ -1137,7 +1285,7 @@ fn obtain_listing(
             },
             JobAnswer::Skip => return Err(SkipReason::Cancelled),
             JobAnswer::CancelBatch => return Err(SkipReason::BatchCancelled),
-            JobAnswer::Overwrite => continue,
+            JobAnswer::Overwrite | JobAnswer::Destination(_) => continue,
         }
     }
 }
@@ -1284,7 +1432,7 @@ mod tests {
         std::fs::write(base.join("other.txt"), b"x").unwrap();
         let archive = base.join(".zip");
         std::fs::write(&archive, b"x").unwrap();
-        assert!(detect_conflicts(&archive, Target::Folder, "").is_empty());
+        assert!(detect_conflicts(&archive, Target::Folder, "", &base).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1293,12 +1441,171 @@ mod tests {
         let base = unique_dir("single");
         let archive = base.join("note.txt.gz");
         std::fs::write(&archive, b"x").unwrap();
-        assert!(detect_single_file_conflict(&archive).is_empty());
+        assert!(detect_single_file_conflict(&archive, &base).is_empty());
         std::fs::write(base.join("note.txt"), b"x").unwrap();
         assert_eq!(
-            detect_single_file_conflict(&archive),
+            detect_single_file_conflict(&archive, &base),
             vec![base.join("note.txt")]
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fixed_destination_is_created() {
+        let base = unique_dir("destination");
+        let archive = base.join("archive.zip");
+        std::fs::write(&archive, b"x").unwrap();
+        let target = base.join("out/nested");
+        let config = Config {
+            destination_mode: DestinationMode::Fixed,
+            destination_dir: Some(target.clone()),
+            ..Config::default()
+        };
+        let (_answer_tx, answer_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut last_destination = None;
+
+        let dir = resolve_workdir(
+            &archive,
+            &config,
+            &mut last_destination,
+            &answer_rx,
+            &event_tx,
+            0,
+            &cancel,
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(dir, target);
+        assert!(target.is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn destination_prompt_uses_submitted_folder() {
+        let base = unique_dir("destination-prompt");
+        let archive = base.join("archive.zip");
+        std::fs::write(&archive, b"x").unwrap();
+        let target = base.join("chosen");
+        let (answer_tx, answer_rx) = mpsc::channel();
+        answer_tx
+            .send(JobAnswer::Destination(target.clone()))
+            .unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let dir = prompt_destination(
+            &archive,
+            false,
+            base.clone(),
+            &answer_rx,
+            &event_tx,
+            0,
+            &cancel,
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(dir, target);
+        assert!(target.is_dir());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(JobEvent::NeedDestination { batch: false, .. })
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn archive_folder_destination_uses_archive_parent() {
+        let base = unique_dir("destination-default");
+        let archive = base.join("archive.zip");
+        std::fs::write(&archive, b"x").unwrap();
+        let config = Config::default();
+        let (_answer_tx, answer_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut last_destination = None;
+
+        let dir = resolve_workdir(
+            &archive,
+            &config,
+            &mut last_destination,
+            &answer_rx,
+            &event_tx,
+            0,
+            &cancel,
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(dir, base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ask_each_reuses_the_previous_destination() {
+        let base = unique_dir("ask-each-previous");
+        let first = base.join("one/archive.zip");
+        let second = base.join("two/archive.zip");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"x").unwrap();
+        std::fs::write(&second, b"x").unwrap();
+        let chosen = base.join("chosen");
+        let config = Config {
+            destination_mode: DestinationMode::AskEach,
+            ..Config::default()
+        };
+        let (answer_tx, answer_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut last_destination = None;
+
+        answer_tx
+            .send(JobAnswer::Destination(chosen.clone()))
+            .unwrap();
+        let dir = resolve_workdir(
+            &first,
+            &config,
+            &mut last_destination,
+            &answer_rx,
+            &event_tx,
+            0,
+            &cancel,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(dir, chosen);
+        let JobEvent::NeedDestination { suggested, .. } = event_rx.try_recv().unwrap() else {
+            panic!("expected a destination request");
+        };
+        assert_eq!(suggested, first.parent().unwrap());
+
+        answer_tx
+            .send(JobAnswer::Destination(chosen.clone()))
+            .unwrap();
+        let dir = resolve_workdir(
+            &second,
+            &config,
+            &mut last_destination,
+            &answer_rx,
+            &event_tx,
+            1,
+            &cancel,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(dir, chosen);
+        let JobEvent::NeedDestination { suggested, .. } = event_rx.try_recv().unwrap() else {
+            panic!("expected a destination request");
+        };
+        assert_eq!(suggested, chosen);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1382,6 +1689,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (answer_tx, answer_rx) = mpsc::channel();
         let mut batch_password = None;
+        let mut last_destination = None;
         let ctx = egui::Context::default();
 
         for answer in answers {
@@ -1397,6 +1705,7 @@ mod tests {
             config,
             &i18n,
             &mut batch_password,
+            &mut last_destination,
             &answer_rx,
             &event_tx,
             0,
