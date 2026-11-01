@@ -140,9 +140,10 @@ ARCH="$APPIMAGE_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 \
     "$APPIMAGETOOL" --updateinformation "$UPDATE_INFO" "$APPDIR" "$OUTPUT"
 
 # zsyncmake may drop the `.zsync` in the current directory instead of next to
-# the AppImage; move it so the release upload picks it up.
-if [ ! -f "$OUTPUT.zsync" ] && [ -f "$(basename "$OUTPUT").zsync" ]; then
-    mv "$(basename "$OUTPUT").zsync" "$OUTPUT.zsync"
+# the AppImage; move it so the release upload picks it up. Always replace a
+# stale file from a previous build.
+if [ -f "$(basename "$OUTPUT").zsync" ]; then
+    mv -f "$(basename "$OUTPUT").zsync" "$OUTPUT.zsync"
 fi
 
 echo "==> Done: $OUTPUT"
