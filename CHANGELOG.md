@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-01
+
 ### Added
 
 - Changing the interface size now shows a hint after 500 ms offering to restart
   the app, since the new scale only lays the window out correctly on a fresh
   start. Restarting is disabled while an extraction is running, and the hint
   can be dismissed to keep using the current session.
+
+### Fixed
+
+- Failures shown in the status line, such as a config that cannot be written,
+  now use a red **Error** prefix instead of looking like ordinary information.
 
 ## [0.3.1] - 2026-10-31
 
