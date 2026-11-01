@@ -1,6 +1,6 @@
 //! Application state and egui rendering.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -420,7 +420,7 @@ impl App {
         }
 
         for path in initial_files {
-            let _ = app.add_file(path);
+            let _ = app.add_file(&path);
         }
         if !app.files.is_empty() {
             app.request_start_batch(&cc.egui_ctx);
@@ -451,8 +451,7 @@ impl App {
             .filter(|(_, file)| file.status == Status::Pending)
             .filter(|(_, file)| {
                 formats::outer_format(&file.path)
-                    .map(|format| self.config.is_format_disabled(format.id))
-                    .unwrap_or(false)
+                    .is_some_and(|format| self.config.is_format_disabled(format.id))
             })
             .map(|(index, _)| index)
             .collect();
@@ -740,7 +739,7 @@ impl App {
                     } else {
                         Status::Failed
                     };
-                    file.message = message.clone();
+                    file.message.clone_from(&message);
 
                     if !success && !skipped {
                         let name = self.file_name(file_index);
@@ -863,8 +862,8 @@ impl App {
     /// multi-volume set the first volume is stored, so the set is queued only
     /// once regardless of which part was passed in. Returns the stored path
     /// when it was added.
-    fn add_file(&mut self, path: PathBuf) -> Option<PathBuf> {
-        let parts = crate::split::archive_parts(&path);
+    fn add_file(&mut self, path: &Path) -> Option<PathBuf> {
+        let parts = crate::split::archive_parts(path);
         let primary = parts.first()?.clone();
         if self.files.iter().any(|file| file.path == primary) {
             return None;
@@ -883,7 +882,7 @@ impl App {
     fn add_files_and_extract(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         let mut added = false;
         for path in paths {
-            if let Some(stored) = self.add_file(path) {
+            if let Some(stored) = self.add_file(&path) {
                 self.push_log(format!("+ {}", stored.display()));
                 added = true;
             }
@@ -1246,10 +1245,10 @@ impl App {
                                 None
                             };
                             let shown = current.map_or(&file.path, |(_, part)| part);
-                            let name = shown
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| shown.display().to_string());
+                            let name = shown.file_name().map_or_else(
+                                || shown.display().to_string(),
+                                |name| name.to_string_lossy().into_owned(),
+                            );
                             ui.label(name).on_hover_text(shown.display().to_string());
                             if let Some((part_index, _)) = current {
                                 ui.label(
@@ -1332,8 +1331,10 @@ impl App {
                                                 file.path
                                                     .parent()
                                                     .filter(|parent| !parent.as_os_str().is_empty())
-                                                    .map(PathBuf::from)
-                                                    .unwrap_or_else(|| PathBuf::from(".")),
+                                                    .map_or_else(
+                                                        || PathBuf::from("."),
+                                                        PathBuf::from,
+                                                    ),
                                             );
                                         }
                                     }
@@ -1391,13 +1392,10 @@ impl App {
 
         let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
         if !maximized {
-            let size = self
-                .saved_window_size
-                .take()
-                .map(|pixels| pixels / ctx.pixels_per_point())
-                .unwrap_or_else(|| {
-                    egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
-                });
+            let size = self.saved_window_size.take().map_or_else(
+                || egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1]),
+                |pixels| pixels / ctx.pixels_per_point(),
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
         ctx.request_repaint();
@@ -1973,10 +1971,8 @@ impl App {
                     };
                 }
                 if ui.button(self.i18n.t("settings.desktop.remove")).clicked() {
-                    self.association_status = match crate::association::remove_desktop() {
-                        Ok(()) => self.i18n.t("settings.desktop.removed"),
-                        Err(err) => format!("{}: {err}", self.i18n.t("common.error")),
-                    };
+                    crate::association::remove_desktop();
+                    self.association_status = self.i18n.t("settings.desktop.removed");
                 }
             });
         }
@@ -2165,11 +2161,10 @@ impl App {
         let Some(prompt) = self.password_prompt.as_ref() else {
             return;
         };
-        let name = prompt
-            .archive
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| prompt.archive.display().to_string());
+        let name = prompt.archive.file_name().map_or_else(
+            || prompt.archive.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         let error = prompt.error.clone();
         let index = prompt.index;
 
@@ -2308,11 +2303,10 @@ impl App {
             return;
         };
         let batch = prompt.batch;
-        let archive_name = prompt
-            .archive
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| prompt.archive.display().to_string());
+        let archive_name = prompt.archive.file_name().map_or_else(
+            || prompt.archive.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         let error = prompt.error.clone();
         let file_index = prompt.index;
 

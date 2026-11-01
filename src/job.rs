@@ -165,14 +165,14 @@ pub fn spawn(
             config: &config,
             i18n: &i18n,
         };
-        run(ouch, archives, &worker);
+        run(&ouch, &archives, &worker);
     });
 
     (controller, event_rx)
 }
 
 /// Runs the whole batch, one archive at a time.
-fn run(ouch: OuchClient, archives: Vec<PathBuf>, worker: &WorkerCtx<'_>) {
+fn run(ouch: &OuchClient, archives: &[PathBuf], worker: &WorkerCtx<'_>) {
     let event_tx = worker.events;
     let ui = worker.ui;
     // Password remembered from the first successful prompt, reused afterwards.
@@ -188,7 +188,7 @@ fn run(ouch: OuchClient, archives: Vec<PathBuf>, worker: &WorkerCtx<'_>) {
         send(event_tx, ui, JobEvent::Started { index });
 
         let event = process_one(
-            &ouch,
+            ouch,
             archive,
             index,
             &mut batch_password,
@@ -343,9 +343,14 @@ fn process_one(
         }
         let result = result_name(archive, kind, None);
         return match ouch.decompress(&source, &workdir, Target::Here, None, current_pid, &log) {
-            Ok(outcome) if outcome.success => {
-                finish_success(index, archive, &cleanup_parts, "here", result, worker)
-            }
+            Ok(outcome) if outcome.success => finish_success(
+                index,
+                archive,
+                &cleanup_parts,
+                "here",
+                result.as_deref(),
+                worker,
+            ),
             Ok(outcome) => fail(index, outcome_message(&outcome)),
             Err(err) => fail(index, err.to_string()),
         };
@@ -357,9 +362,8 @@ fn process_one(
     let mut password: Option<String> = None;
     let mut listing: Option<String> = None;
     let mut target = match config.decompress_mode {
-        DecompressMode::Folder => Target::Folder,
+        DecompressMode::Folder | DecompressMode::Smart => Target::Folder,
         DecompressMode::Here => Target::Here,
-        DecompressMode::Smart => Target::Folder,
     };
 
     match obtain_listing(ouch, &source, index, batch_password, worker) {
@@ -405,9 +409,7 @@ fn process_one(
 
     // When extracting "here" and the result name differs from the archive
     // (e.g. `foo.zip` containing `bar.ipa`), report the resulting name.
-    // Reported once, on the first successful attempt, so the later attempts
-    // can take it instead of cloning.
-    let mut result = if target == Target::Here {
+    let result = if target == Target::Here {
         result_name(archive, kind, listing.as_deref())
     } else {
         None
@@ -457,7 +459,7 @@ fn process_one(
                     archive,
                     &cleanup_parts,
                     target.label(),
-                    result.take(),
+                    result.as_deref(),
                     worker,
                 );
             }
@@ -512,7 +514,7 @@ fn process_one(
                             archive,
                             &cleanup_parts,
                             target.label(),
-                            result.take(),
+                            result.as_deref(),
                             worker,
                         );
                     }
@@ -527,7 +529,7 @@ fn process_one(
             }
             JobAnswer::Skip => return fail(index, "skipped".into()),
             JobAnswer::CancelBatch => return fail(index, "cancelled".into()),
-            JobAnswer::Overwrite | JobAnswer::Destination(_) => continue,
+            JobAnswer::Overwrite | JobAnswer::Destination(_) => {}
         }
     }
 }
@@ -549,15 +551,16 @@ fn resolve_workdir(
             Some(dir) if !dir.as_os_str().is_empty() => absolute(dir),
             _ => return Err("no destination folder configured in settings".into()),
         },
-        DestinationMode::AskBatch => match last_destination.as_ref() {
-            Some(dir) => dir.clone(),
-            None => {
+        DestinationMode::AskBatch => {
+            if let Some(dir) = last_destination.as_ref() {
+                dir.clone()
+            } else {
                 let dir =
                     prompt_destination(archive, PromptScope::Batch, suggested, index, worker)?;
                 *last_destination = Some(dir.clone());
                 return Ok(dir);
             }
-        },
+        }
         DestinationMode::AskEach => {
             let dir = prompt_destination(archive, PromptScope::Single, suggested, index, worker)?;
             *last_destination = Some(dir.clone());
@@ -622,7 +625,7 @@ fn prompt_destination(
             }
             JobAnswer::Skip => return Err("skipped".into()),
             JobAnswer::CancelBatch => return Err("cancelled".into()),
-            JobAnswer::Password(_) | JobAnswer::Overwrite => continue,
+            JobAnswer::Password(_) | JobAnswer::Overwrite => {}
         }
     }
 }
@@ -648,8 +651,7 @@ fn parent_dir(archive: &Path) -> PathBuf {
     archive
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// True when `name` is a single, normal path component.
@@ -677,8 +679,7 @@ fn detect_conflicts(archive: &Path, target: Target, listing: &str, workdir: &Pat
             let destination = workdir.join(stem);
             let non_empty = destination
                 .read_dir()
-                .map(|mut entries| entries.next().is_some())
-                .unwrap_or(false);
+                .is_ok_and(|mut entries| entries.next().is_some());
             if destination.is_dir() && non_empty {
                 vec![destination]
             } else {
@@ -750,7 +751,7 @@ fn apply_conflict_policy(
                     JobAnswer::Overwrite => return Ok(()),
                     JobAnswer::Skip => return Err("skipped".into()),
                     JobAnswer::CancelBatch => return Err("cancelled".into()),
-                    JobAnswer::Password(_) | JobAnswer::Destination(_) => continue,
+                    JobAnswer::Password(_) | JobAnswer::Destination(_) => {}
                 }
             }
         }
@@ -867,7 +868,7 @@ fn finish_success(
     archive: &Path,
     parts: &[PathBuf],
     target_label: &str,
-    result: Option<String>,
+    result: Option<&str>,
     worker: &WorkerCtx<'_>,
 ) -> JobEvent {
     let cleanup_error = cleanup_sources(parts, worker.config, worker.events, worker.ui, index);
@@ -877,9 +878,7 @@ fn finish_success(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let result_summary = result
-        .as_ref()
-        .map(|result| format!("{archive_name} → {result}"));
+    let result_summary = result.map(|result| format!("{archive_name} → {result}"));
     let message_name = result_summary
         .clone()
         .unwrap_or_else(|| archive_name.clone());
@@ -934,10 +933,10 @@ fn fail(index: usize, message: String) -> JobEvent {
 
 /// Extracts the most relevant message from an ouch outcome.
 fn outcome_message(outcome: &crate::ouch::DecompressOutcome) -> String {
-    if !outcome.stderr.trim().is_empty() {
-        outcome.stderr.trim().to_string()
-    } else {
+    if outcome.stderr.trim().is_empty() {
         outcome.stdout.trim().to_string()
+    } else {
+        outcome.stderr.trim().to_string()
     }
 }
 
@@ -1077,9 +1076,7 @@ impl ProgressPoller {
         let mut cumulative = Vec::with_capacity(parts.len());
         let mut total = 0u64;
         for part in parts {
-            total += std::fs::metadata(part)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            total += std::fs::metadata(part).map_or(0, |metadata| metadata.len());
             cumulative.push(total);
         }
         if total == 0 {
@@ -1100,7 +1097,15 @@ impl ProgressPoller {
         let event_tx = event_tx.clone();
         let ctx = ctx.clone();
         let handle = thread::spawn(move || {
-            run_progress_poller(index, total, cumulative, pid_slot, event_tx, ctx, stop_rx);
+            run_progress_poller(
+                index,
+                total,
+                &cumulative,
+                &pid_slot,
+                &event_tx,
+                &ctx,
+                &stop_rx,
+            );
         });
         Some(Self {
             stop_tx,
@@ -1123,11 +1128,11 @@ impl Drop for ProgressPoller {
 fn run_progress_poller(
     index: usize,
     total: u64,
-    cumulative: Vec<u64>,
-    pid_slot: Arc<AtomicU32>,
-    event_tx: Sender<JobEvent>,
-    ctx: egui::Context,
-    stop_rx: Receiver<()>,
+    cumulative: &[u64],
+    pid_slot: &Arc<AtomicU32>,
+    event_tx: &Sender<JobEvent>,
+    ctx: &egui::Context,
+    stop_rx: &Receiver<()>,
 ) {
     // Speed/ETA tracking. Both rates are averaged over a ~1 s window and only
     // refreshed that often, so the numbers stay readable. Reset whenever the
@@ -1144,14 +1149,7 @@ fn run_progress_poller(
         if pid != 0 {
             if let Some((read, write)) = process_io(pid) {
                 let now = std::time::Instant::now();
-                if pid != last_pid {
-                    last_pid = pid;
-                    last_speed_read = read;
-                    last_speed_write = write;
-                    last_speed_time = now;
-                    read_speed = None;
-                    write_speed = None;
-                } else {
+                if pid == last_pid {
                     let window = now.duration_since(last_speed_time).as_secs_f64();
                     if window >= 1.0 {
                         read_speed = Some(smooth_speed(
@@ -1168,9 +1166,16 @@ fn run_progress_poller(
                         last_speed_write = write;
                         last_speed_time = now;
                     }
+                } else {
+                    last_pid = pid;
+                    last_speed_read = read;
+                    last_speed_write = write;
+                    last_speed_time = now;
+                    read_speed = None;
+                    write_speed = None;
                 }
                 let fraction = progress_math::fraction_of(read, total);
-                let part_index = part_index_for(read, &cumulative);
+                let part_index = part_index_for(read, cumulative);
                 let eta_secs = estimate_eta(total.saturating_sub(read), read_speed.unwrap_or(0.0))
                     .unwrap_or(0);
                 let _ = event_tx.send(JobEvent::Progress {
@@ -1185,9 +1190,8 @@ fn run_progress_poller(
             }
         }
         match stop_rx.recv_timeout(Duration::from_millis(80)) {
-            Ok(()) => break,
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -1249,7 +1253,7 @@ fn obtain_listing(
         match ouch.list(archive, candidate.as_deref(), &log) {
             Ok(listing) => {
                 if candidate.is_some() {
-                    *batch_password = candidate.clone();
+                    batch_password.clone_from(&candidate);
                 }
                 return Ok((listing, candidate));
             }
@@ -1300,7 +1304,7 @@ fn obtain_listing(
             },
             JobAnswer::Skip => return Err(SkipReason::Cancelled),
             JobAnswer::CancelBatch => return Err(SkipReason::BatchCancelled),
-            JobAnswer::Overwrite | JobAnswer::Destination(_) => continue,
+            JobAnswer::Overwrite | JobAnswer::Destination(_) => {}
         }
     }
 }
@@ -1384,7 +1388,8 @@ mod tests {
     #[test]
     fn smooths_write_speed() {
         // First sample is instantaneous.
-        assert_eq!(smooth_speed(None, 1_000_000, 1.0), 1_000_000.0);
+        let instant = smooth_speed(None, 1_000_000, 1.0);
+        assert!((instant - 1_000_000.0).abs() < f64::EPSILON);
         // Later samples move only partway toward the new rate.
         let smoothed = smooth_speed(Some(1_000_000.0), 2_000_000, 1.0);
         let alpha = 1.0 - (-1.0_f64 / SPEED_TAU).exp();
@@ -1392,7 +1397,8 @@ mod tests {
         assert!((smoothed - expected).abs() < 1.0);
         assert!(smoothed > 1_000_000.0 && smoothed < 2_000_000.0);
         // A zero interval keeps the previous value.
-        assert_eq!(smooth_speed(Some(42.0), 999, 0.0), 42.0);
+        let kept = smooth_speed(Some(42.0), 999, 0.0);
+        assert!((kept - 42.0).abs() < f64::EPSILON);
     }
 
     #[test]

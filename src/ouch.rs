@@ -28,7 +28,7 @@ pub struct OuchClient {
 
 impl OuchClient {
     /// Finds an `ouch` binary to use, preferring one bundled next to the app
-    /// (as installed in an AppImage) over one found on `PATH`.
+    /// (as installed in an `AppImage`) over one found on `PATH`.
     ///
     /// A candidate is only accepted if it actually runs `--version`
     /// successfully, so a broken/corrupted bundled binary falls back to a
@@ -243,7 +243,8 @@ fn describe_command(cmd: &Command) -> String {
             out.push_str(" -p ****");
             let _ = args.next();
         } else if arg.contains(|c: char| c.is_whitespace()) {
-            out.push_str(&format!(" \"{arg}\""));
+            use std::fmt::Write as _;
+            let _ = write!(out, " \"{arg}\"");
         } else {
             out.push(' ');
             out.push_str(&arg);

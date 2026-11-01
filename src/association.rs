@@ -2,12 +2,14 @@
 //!
 //! Setting the app as the default handler only runs `xdg-mime default` for the
 //! enabled MIME types. The desktop entry itself is normally provided by the
-//! AppImage manager (e.g. Gear Lever); this module detects it and uses it, so
+//! `AppImage` manager (e.g. Gear Lever); this module detects it and uses it, so
 //! it does not create a second, duplicate entry.
 //!
 //! The legacy entry/mime/icons that older versions installed are only written
 //! as a fallback when no other launcher exists, and are removed when a real one
 //! is found. Everything lives in the user's home, so no root is required.
+
+use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -30,7 +32,7 @@ const ICON_512: &[u8] = include_bytes!("../assets/ouch-decompress-gui.png");
 
 /// Path of the executable that the desktop entry should launch.
 ///
-/// Inside an AppImage the real artifact is pointed to by `$APPIMAGE`; running
+/// Inside an `AppImage` the real artifact is pointed to by `$APPIMAGE`; running
 /// from a build tree falls back to the current executable.
 pub fn app_exec_path() -> PathBuf {
     if let Ok(appimage) = std::env::var("APPIMAGE") {
@@ -140,9 +142,9 @@ pub fn build_mime_xml(config: &Config) -> String {
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str("<mime-info xmlns=\"http://www.freedesktop.org/standards/shared-mime-info\">\n");
     for (mime, patterns) in &globs {
-        xml.push_str(&format!("  <mime-type type=\"{mime}\">\n"));
+        let _ = writeln!(xml, "  <mime-type type=\"{mime}\">");
         for pattern in patterns {
-            xml.push_str(&format!("    <glob pattern=\"{pattern}\"/>\n"));
+            let _ = writeln!(xml, "    <glob pattern=\"{pattern}\"/>");
         }
         xml.push_str("  </mime-type>\n");
     }
@@ -190,7 +192,7 @@ fn quote_exec(path: &str) -> String {
 }
 
 /// Installs a fallback desktop entry, MIME package and icons for the enabled
-/// formats. Only used when no AppImage manager provides a launcher.
+/// formats. Only used when no `AppImage` manager provides a launcher.
 fn apply(config: &Config) -> Result<()> {
     let desktop = desktop_path();
     let mime = mime_package_path();
@@ -215,7 +217,7 @@ fn apply(config: &Config) -> Result<()> {
 }
 
 /// Basename of a desktop entry (other than ours) that launches this app, such
-/// as the one an AppImage manager creates for the file.
+/// as the one an `AppImage` manager creates for the file.
 fn find_external_launcher() -> Option<String> {
     let target = app_exec_path();
     let target = target.to_string_lossy();
@@ -250,26 +252,23 @@ fn find_external_launcher() -> Option<String> {
 }
 
 /// Removes the legacy entry/mime/icons this app used to install, when another
-/// manager already provides a launcher for this AppImage.
+/// manager already provides a launcher for this `AppImage`.
 pub fn remove_legacy_if_redundant() {
     if desktop_path().exists() && find_external_launcher().is_some() {
-        let _ = remove();
+        remove();
     }
 }
 
 /// Makes this app the default handler for every enabled MIME type, using the
-/// desktop entry provided by the AppImage manager when there is one.
+/// desktop entry provided by the `AppImage` manager when there is one.
 pub fn set_default(config: &Config) -> Result<()> {
-    let handler = match find_external_launcher() {
-        Some(name) => {
-            // Another manager owns the entry; drop our duplicate if present.
-            let _ = remove();
-            name
-        }
-        None => {
-            apply(config)?;
-            DESKTOP_FILE.to_string()
-        }
+    let handler = if let Some(name) = find_external_launcher() {
+        // Another manager owns the entry; drop our duplicate if present.
+        remove();
+        name
+    } else {
+        apply(config)?;
+        DESKTOP_FILE.to_string()
     };
     for mime_type in enabled_mime_types(config) {
         let _ = Command::new("xdg-mime")
@@ -279,14 +278,14 @@ pub fn set_default(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// True when the app runs from an AppImage: the runtime exports `$APPIMAGE`
+/// True when the app runs from an `AppImage`: the runtime exports `$APPIMAGE`
 /// with the path to the artifact.
 pub fn running_as_appimage() -> bool {
     std::env::var("APPIMAGE").is_ok_and(|path| !path.is_empty())
 }
 
-/// Writes the desktop entry, MIME package and icons so the AppImage shows up in
-/// the application menu without relying on an AppImage manager. Returns the
+/// Writes the desktop entry, MIME package and icons so the `AppImage` shows up in
+/// the application menu without relying on an `AppImage` manager. Returns the
 /// desktop entry path.
 pub fn create_desktop(config: &Config) -> Result<PathBuf> {
     apply(config)?;
@@ -295,18 +294,17 @@ pub fn create_desktop(config: &Config) -> Result<PathBuf> {
 
 /// Removes the desktop entry, MIME package and icons written by
 /// [`create_desktop`].
-pub fn remove_desktop() -> Result<()> {
-    remove()
+pub fn remove_desktop() {
+    remove();
 }
 
 /// Removes the legacy desktop entry, MIME package and icons, then refreshes the
 /// XDG databases.
-fn remove() -> Result<()> {
+fn remove() {
     let _ = std::fs::remove_file(desktop_path());
     let _ = std::fs::remove_file(mime_package_path());
     remove_icons();
     refresh_databases();
-    Ok(())
 }
 
 /// Installs the app icons into the user's icon theme so the application menu

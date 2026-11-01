@@ -26,7 +26,7 @@ impl DecompressMode {
     ];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             DecompressMode::Folder => "mode.folder",
             DecompressMode::Here => "mode.here",
@@ -35,7 +35,7 @@ impl DecompressMode {
     }
 
     /// Translation key for the explanation shown under the option.
-    pub fn hint_key(&self) -> &'static str {
+    pub fn hint_key(self) -> &'static str {
         match self {
             DecompressMode::Folder => "mode.folder.hint",
             DecompressMode::Here => "mode.here.hint",
@@ -69,7 +69,7 @@ impl DestinationMode {
     ];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             DestinationMode::ArchiveFolder => "destination.archive_folder",
             DestinationMode::Fixed => "destination.fixed",
@@ -79,7 +79,7 @@ impl DestinationMode {
     }
 
     /// Translation key for the explanation shown under the option.
-    pub fn hint_key(&self) -> &'static str {
+    pub fn hint_key(self) -> &'static str {
         match self {
             DestinationMode::ArchiveFolder => "destination.archive_folder.hint",
             DestinationMode::Fixed => "destination.fixed.hint",

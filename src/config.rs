@@ -36,7 +36,7 @@ impl ConflictPolicy {
     ];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             ConflictPolicy::Ask => "conflict.ask",
             ConflictPolicy::Overwrite => "conflict.overwrite",
@@ -67,7 +67,7 @@ impl AfterExtract {
     ];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             AfterExtract::Trash => "after.trash",
             AfterExtract::Delete => "after.delete",
@@ -92,7 +92,7 @@ impl TrashFallback {
     pub const ALL: [TrashFallback; 2] = [TrashFallback::Delete, TrashFallback::Nothing];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             TrashFallback::Delete => "trash_fallback.delete",
             TrashFallback::Nothing => "trash_fallback.nothing",
@@ -122,7 +122,7 @@ impl Notifications {
     ];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             Notifications::Always => "notify.policy.always",
             Notifications::OnFailure => "notify.policy.on_failure",
@@ -147,7 +147,7 @@ impl PasswordSort {
     pub const ALL: [PasswordSort; 2] = [PasswordSort::Alphabetical, PasswordSort::Added];
 
     /// Translation key for the label.
-    pub fn label_key(&self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
             PasswordSort::Alphabetical => "password_sort.alphabetical",
             PasswordSort::Added => "password_sort.added",

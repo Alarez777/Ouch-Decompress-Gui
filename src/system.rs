@@ -27,8 +27,7 @@ pub fn trash_file(path: &Path) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+        .is_ok_and(|status| status.success());
     if gio {
         return true;
     }
@@ -38,8 +37,7 @@ pub fn trash_file(path: &Path) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 /// Shows a desktop notification via `notify-send`, if available.

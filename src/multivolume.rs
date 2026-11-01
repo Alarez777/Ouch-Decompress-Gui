@@ -89,10 +89,10 @@ pub fn prepare(
 /// The base name of the split without its volume number (`def.7z.001` ->
 /// `def.7z`), so `ouch` names its output folder after the archive.
 fn base_name(archive: &Path) -> String {
-    let name = archive
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "archive".to_string());
+    let name = archive.file_name().map_or_else(
+        || "archive".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     match name.rsplit_once('.') {
         Some((prefix, last)) if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) => {
             prefix.to_string()
@@ -167,17 +167,14 @@ fn copy_parts(
 
 /// Size of a file, or 0 when it cannot be read.
 fn file_size(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 /// Monotonic-ish unique suffix for temporary names.
 fn unique_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0)
+        .map_or(0, |elapsed| elapsed.as_nanos())
 }
 
 /// True when `path` exists and is writable by this user.
@@ -202,7 +199,7 @@ fn available_space(path: &Path) -> Option<u64> {
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `path` is a valid NUL-terminated string and `stat` is a live
     // `statvfs` that the call writes to.
-    let ok = unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0;
+    let ok = unsafe { libc::statvfs(path.as_ptr(), &raw mut stat) } == 0;
     if !ok {
         return None;
     }
