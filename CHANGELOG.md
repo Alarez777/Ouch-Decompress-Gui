@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Settings now include an extraction destination: next to each archive (default),
+  a fixed folder, ask once when the batch starts, or ask for every file. The
+  extraction mode is applied inside the chosen destination.
+
+### Changed
+
+- The destination prompt now focuses **Extract here**, so `Enter` confirms it.
+  With **Ask for every file**, the first archive suggests its own directory and
+  the following ones suggest the last chosen directory.
+
 ## [0.3.0] - 2026-10-25
 
 ### Added

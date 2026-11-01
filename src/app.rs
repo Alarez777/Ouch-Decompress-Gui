@@ -12,7 +12,7 @@ use crate::config::{
 use crate::formats;
 use crate::i18n::I18n;
 use crate::job::{self, JobAnswer, JobController, JobEvent};
-use crate::modes::DecompressMode;
+use crate::modes::{DecompressMode, DestinationMode};
 use crate::ouch::OuchClient;
 use crate::theme::{self, ThemeChoice};
 
@@ -127,6 +127,24 @@ struct OverwritePrompt {
     conflicts: Vec<PathBuf>,
 }
 
+/// Pending destination request from the worker.
+struct DestinationPrompt {
+    /// Index in `files`, when the archive is part of the visible queue.
+    index: Option<usize>,
+    archive: PathBuf,
+    /// Whether the answer applies to the whole batch.
+    batch: bool,
+    /// Validation error from a previously submitted path.
+    error: Option<String>,
+}
+
+/// Which field receives the result of the native folder picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirPickerTarget {
+    Settings,
+    Prompt,
+}
+
 /// Root application.
 pub struct App {
     config: Config,
@@ -173,6 +191,18 @@ pub struct App {
     event_rx: Option<Receiver<JobEvent>>,
     password_prompt: Option<PasswordPrompt>,
     overwrite_prompt: Option<OverwritePrompt>,
+    /// Pending destination request from the worker.
+    destination_prompt: Option<DestinationPrompt>,
+    /// Path shown in the destination prompt.
+    destination_input: String,
+    /// Set when a destination prompt appears, so its confirm button gets focus once.
+    destination_focus: bool,
+    /// Editable fixed destination shown in the settings.
+    destination_dir_input: String,
+    /// Receiver for the in-flight native folder picker.
+    dir_picker_rx: Option<Receiver<Option<PathBuf>>>,
+    /// Which field the folder picker result belongs to.
+    dir_picker_target: Option<DirPickerTarget>,
     password_input: String,
     new_password_input: String,
     /// Text of the "add multiple passwords" dialog, one per line.
@@ -246,6 +276,11 @@ impl App {
 
         let auto_close_on_success = !initial_files.is_empty() && !open_settings;
         let initial_scale = config.ui_scale;
+        let destination_dir_input = config
+            .destination_dir
+            .as_ref()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         let mut app = Self {
             config,
@@ -278,6 +313,12 @@ impl App {
             event_rx: None,
             password_prompt: None,
             overwrite_prompt: None,
+            destination_prompt: None,
+            destination_input: String::new(),
+            destination_focus: false,
+            destination_dir_input,
+            dir_picker_rx: None,
+            dir_picker_target: None,
             password_input: String::new(),
             new_password_input: String::new(),
             bulk_password_input: String::new(),
@@ -314,6 +355,16 @@ impl App {
     /// which case the user is asked to confirm first.
     fn request_start_batch(&mut self, ctx: &egui::Context) {
         if self.running {
+            return;
+        }
+        if self.config.destination_mode == DestinationMode::Fixed
+            && self
+                .config
+                .destination_dir
+                .as_ref()
+                .is_none_or(|dir| dir.as_os_str().is_empty())
+        {
+            self.error_popup = Some(self.i18n.t("destination.not_set"));
             return;
         }
         let disabled: Vec<usize> = self
@@ -459,6 +510,57 @@ impl App {
         }
     }
 
+    /// Opens the native folder picker on a background thread.
+    fn start_dir_picker(&mut self, target: DirPickerTarget, ctx: &egui::Context) {
+        if self.dir_picker_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let pid_slot = self.picker_pid.clone();
+        thread::spawn(move || {
+            let dir = crate::system::pick_directory(&pid_slot);
+            if tx.send(dir).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        self.dir_picker_rx = Some(rx);
+        self.dir_picker_target = Some(target);
+    }
+
+    /// Receives the folder-picker result, if it is ready.
+    fn pump_dir_picker(&mut self) {
+        let result = match &self.dir_picker_rx {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        match result {
+            Ok(dir) => {
+                self.dir_picker_rx = None;
+                let target = self.dir_picker_target.take();
+                let Some(dir) = dir else {
+                    return;
+                };
+                match target {
+                    Some(DirPickerTarget::Settings) => {
+                        self.destination_dir_input = dir.to_string_lossy().into_owned();
+                        self.config.destination_dir = Some(dir);
+                        self.persist();
+                    }
+                    Some(DirPickerTarget::Prompt) => {
+                        self.destination_input = dir.to_string_lossy().into_owned();
+                    }
+                    None => {}
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.dir_picker_rx = None;
+                self.dir_picker_target = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     fn handle_event(&mut self, event: JobEvent) {
         match event {
             JobEvent::Started { index } => {
@@ -523,6 +625,26 @@ impl App {
                     });
                     self.files[file_index].message = "waiting for overwrite confirmation".into();
                 }
+            }
+            JobEvent::NeedDestination {
+                index,
+                archive,
+                batch,
+                suggested,
+                error,
+            } => {
+                let file_index = self.file_index(index);
+                if let Some(file_index) = file_index {
+                    self.files[file_index].message = "waiting for destination".into();
+                }
+                self.destination_input = suggested.to_string_lossy().into_owned();
+                self.destination_focus = true;
+                self.destination_prompt = Some(DestinationPrompt {
+                    index: file_index,
+                    archive,
+                    batch,
+                    error,
+                });
             }
             JobEvent::Done {
                 index,
@@ -726,6 +848,13 @@ impl App {
         }
     }
 
+    /// Sends an answer to the worker, if a batch is running.
+    fn send_answer(&self, answer: JobAnswer) {
+        if let Some(controller) = &self.controller {
+            let _ = controller.answer_tx.send(answer);
+        }
+    }
+
     fn answer_password(&mut self, answer: JobAnswer) {
         if let Some(controller) = &self.controller {
             let _ = controller.answer_tx.send(answer);
@@ -754,6 +883,7 @@ impl App {
         }
         self.password_prompt = None;
         self.password_input.clear();
+        self.destination_prompt = None;
     }
 
     fn current_child_pid(&self) -> u32 {
@@ -830,6 +960,7 @@ impl eframe::App for App {
         self.pump_events();
         self.pump_update();
         self.pump_file_picker(&ctx);
+        self.pump_dir_picker();
         self.handle_dropped_files(&ctx);
 
         if self.restart_pending {
@@ -897,6 +1028,7 @@ impl eframe::App for App {
         self.ui_password_modal(&ctx);
         self.ui_confirm_disabled(&ctx);
         self.ui_overwrite_modal(&ctx);
+        self.ui_destination_modal(&ctx);
         self.ui_close_confirm(&ctx);
         self.ui_error_modal(&ctx);
         self.draw_drop_overlay(&ctx);
@@ -1135,6 +1267,7 @@ impl App {
     fn modal_open(&self) -> bool {
         self.password_prompt.is_some()
             || self.overwrite_prompt.is_some()
+            || self.destination_prompt.is_some()
             || self.confirm_disabled.is_some()
             || self.confirm_close
             || self.error_popup.is_some()
@@ -1471,6 +1604,64 @@ impl App {
         );
 
         ui.add_space(12.0);
+        ui.label(egui::RichText::new(self.i18n.t("destination.section")).strong());
+        let mut changed = false;
+        egui::ComboBox::from_id_salt("destination-combo")
+            .selected_text(self.i18n.t(self.config.destination_mode.label_key()))
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                for mode in DestinationMode::ALL {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.config.destination_mode,
+                            mode,
+                            self.i18n.t(mode.label_key()),
+                        )
+                        .changed();
+                }
+            });
+        if changed {
+            self.persist();
+        }
+        ui.label(
+            egui::RichText::new(self.i18n.t(self.config.destination_mode.hint_key()))
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+
+        if self.config.destination_mode == DestinationMode::Fixed {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(self.i18n.t("destination.folder"));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.destination_dir_input)
+                        .desired_width(240.0),
+                );
+                if response.changed() {
+                    let value = self.destination_dir_input.trim();
+                    self.config.destination_dir = (!value.is_empty()).then(|| PathBuf::from(value));
+                    self.persist();
+                }
+                if ui
+                    .add_enabled(
+                        self.dir_picker_rx.is_none(),
+                        egui::Button::new(self.i18n.t("destination.choose")),
+                    )
+                    .clicked()
+                {
+                    self.start_dir_picker(DirPickerTarget::Settings, ui.ctx());
+                }
+            });
+            if self.config.destination_dir.is_none() {
+                ui.label(
+                    egui::RichText::new(self.i18n.t("destination.not_set"))
+                        .small()
+                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
+                );
+            }
+        }
+
+        ui.add_space(12.0);
         ui.label(egui::RichText::new(self.i18n.t("settings.conflict")).strong());
         let mut changed = false;
         egui::ComboBox::from_id_salt("conflict-combo")
@@ -1623,6 +1814,7 @@ impl App {
             let passwords = std::mem::take(&mut self.config.passwords);
             self.config = Config::default();
             self.config.passwords = passwords;
+            self.destination_dir_input.clear();
             self.i18n = I18n::new(self.config.language);
             theme::apply(ui.ctx(), self.config.theme);
             self.applied_theme = Some(self.config.theme);
@@ -2021,6 +2213,103 @@ impl App {
         } else if close {
             self.confirm_close = false;
             self.abort_and_close();
+        }
+    }
+
+    fn ui_destination_modal(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.destination_prompt.as_ref() else {
+            return;
+        };
+        let batch = prompt.batch;
+        let archive_name = prompt
+            .archive
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| prompt.archive.display().to_string());
+        let error = prompt.error.clone();
+        let file_index = prompt.index;
+
+        let mut confirm = false;
+        let mut skip = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("destination-modal")).show(ctx, |ui| {
+            let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
+            ui.set_min_width(max_width.min(420.0));
+            ui.set_max_width(max_width);
+            ui.heading(self.i18n.t("destination.prompt.title"));
+            let body = if batch {
+                self.i18n
+                    .t("destination.prompt.batch_body")
+                    .replace("{count}", &self.batch_indices.len().to_string())
+            } else {
+                self.i18n
+                    .t("destination.prompt.file_body")
+                    .replace("{name}", &archive_name)
+            };
+            ui.label(body);
+            if let Some(error) = &error {
+                ui.label(
+                    egui::RichText::new(error)
+                        .small()
+                        .color(egui::Color32::from_rgb(0xd9, 0x30, 0x25)),
+                );
+            }
+            ui.add_space(4.0);
+            ui.label(self.i18n.t("destination.folder"));
+            let input = ui
+                .add(egui::TextEdit::singleline(&mut self.destination_input).desired_width(320.0));
+            let submitted = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui
+                .add_enabled(
+                    self.dir_picker_rx.is_none(),
+                    egui::Button::new(self.i18n.t("destination.choose")),
+                )
+                .clicked()
+            {
+                self.start_dir_picker(DirPickerTarget::Prompt, ui.ctx());
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let confirm_button = ui.button(self.i18n.t("destination.prompt.confirm"));
+                if self.destination_focus {
+                    confirm_button.request_focus();
+                    self.destination_focus = false;
+                }
+                if confirm_button.clicked() || submitted {
+                    confirm = true;
+                }
+                if !batch && ui.button(self.i18n.t("destination.prompt.skip")).clicked() {
+                    skip = true;
+                }
+                if ui.button(self.i18n.t("password.cancel_all")).clicked() {
+                    cancel = true;
+                }
+            });
+            if let Some(file) = file_index.and_then(|index| self.files.get_mut(index)) {
+                file.status = Status::Running;
+            }
+        });
+
+        if cancel {
+            self.destination_prompt = None;
+            self.destination_focus = false;
+            self.cancel_batch();
+        } else if skip {
+            self.destination_prompt = None;
+            self.destination_focus = false;
+            self.send_answer(JobAnswer::Skip);
+        } else if confirm {
+            let path = self.destination_input.trim().to_string();
+            if path.is_empty() {
+                let message = self.i18n.t("destination.not_set");
+                if let Some(prompt) = &mut self.destination_prompt {
+                    prompt.error = Some(message);
+                }
+            } else {
+                self.destination_prompt = None;
+                self.destination_focus = false;
+                self.send_answer(JobAnswer::Destination(PathBuf::from(path)));
+            }
         }
     }
 

@@ -92,6 +92,37 @@ pub fn pick_files(pid_slot: &AtomicU32) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Opens a native single-directory picker through `zenity`.
+///
+/// While the dialog is open, `pid_slot` holds zenity's PID (or 0), so the app
+/// can terminate it if it exits first. Returns `None` when the user cancels or
+/// when `zenity` is not installed.
+pub fn pick_directory(pid_slot: &AtomicU32) -> Option<PathBuf> {
+    let child = Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--directory",
+            "--title=Select destination directory",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+
+    let child = child.ok()?;
+    pid_slot.store(child.id(), Ordering::Relaxed);
+    let output = child.wait_with_output();
+    pid_slot.store(0, Ordering::Relaxed);
+
+    let output = output.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
 /// Terminates a process, first politely and then forcefully.
 ///
 /// Sends `SIGTERM` and waits up to 500 ms for the process to exit; if it is
