@@ -281,7 +281,7 @@ impl App {
         initial_files: Vec<PathBuf>,
         startup: Startup,
     ) -> Self {
-        let config = Config::load();
+        let (config, config_warning) = Config::load();
         let i18n = I18n::new(config.language);
         theme::apply(&cc.egui_ctx, config.theme);
         cc.egui_ctx
@@ -365,6 +365,12 @@ impl App {
             joining: false,
             batch_started: None,
         };
+
+        // A corrupt config must be visible: stderr goes nowhere in an AppImage.
+        if let Some(warning) = config_warning {
+            app.status_line = format!("{}: {warning}", app.i18n.t("common.error"));
+            app.push_log(warning);
+        }
 
         for path in initial_files {
             let _ = app.add_file(path);

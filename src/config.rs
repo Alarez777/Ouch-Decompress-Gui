@@ -253,22 +253,24 @@ impl Config {
 
     /// Loads the config, falling back to defaults when the file is missing or
     /// unreadable. Never fails: a corrupt config should not brick the app.
-    pub fn load() -> Self {
+    ///
+    /// The second value explains a config file that exists but cannot be
+    /// parsed, so the UI can show it; a missing file is normal and silent.
+    pub fn load() -> (Self, Option<String>) {
         Self::load_from(&Self::path())
     }
 
     /// Loads the config from an explicit path.
-    #[expect(
-        clippy::print_stderr,
-        reason = "a corrupt config is reported before the UI exists to show it"
-    )]
-    pub fn load_from(path: &std::path::Path) -> Self {
+    pub fn load_from(path: &std::path::Path) -> (Self, Option<String>) {
         match std::fs::read_to_string(path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|err| {
-                eprintln!("warning: invalid config at {}: {err}", path.display());
-                Config::default()
-            }),
-            Err(_) => Config::default(),
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(config) => (config, None),
+                Err(err) => (
+                    Config::default(),
+                    Some(format!("invalid config at {}: {err}", path.display())),
+                ),
+            },
+            Err(_) => (Config::default(), None),
         }
     }
 
@@ -336,7 +338,8 @@ mod tests {
         };
 
         config.save_to(&path).unwrap();
-        let loaded = Config::load_from(&path);
+        let (loaded, warning) = Config::load_from(&path);
+        assert!(warning.is_none(), "a valid config must not warn");
 
         assert_eq!(loaded.conflict_policy, ConflictPolicy::Rename);
         assert_eq!(loaded.after_extract, AfterExtract::Keep);
@@ -348,6 +351,29 @@ mod tests {
         );
         assert_eq!(loaded.ui_scale, 150);
         assert_eq!(loaded.passwords, vec!["secret".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_config_falls_back_and_reports_why() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ouch-gui-config-bad-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let (loaded, warning) = Config::load_from(&path);
+
+        assert_eq!(loaded.ui_scale, Config::default().ui_scale);
+        let warning = warning.expect("a corrupt config must be reported");
+        assert!(
+            warning.contains("config.json"),
+            "the warning should name the file: {warning}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
