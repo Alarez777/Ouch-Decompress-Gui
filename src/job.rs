@@ -1,18 +1,21 @@
 //! Background batch extraction.
 //!
-//! A single worker thread processes archives sequentially so that a password
-//! entered for the first archive can be reused for the rest of the batch.
-//! Communication with the UI uses channels; the worker never touches egui
-//! state directly.
+//! A small pool of worker threads extracts several archives at once
+//! (`Config::parallel_extractions`, clamped to a safe range). A password
+//! entered for one archive is reused for the rest of the batch, and prompts to
+//! the UI are serialized so only one modal is shown at a time. Communication
+//! with the UI uses channels; workers never touch egui state directly.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::config::{AfterExtract, Config, ConflictPolicy, TrashFallback};
+use crate::config::{
+    AfterExtract, Config, ConflictPolicy, TrashFallback, MAX_PARALLEL_EXTRACTIONS,
+};
 use crate::formats::{self, ArchiveKind};
 use crate::i18n::I18n;
 use crate::modes::{self, DecompressMode, DestinationMode, Target};
@@ -109,9 +112,9 @@ pub enum JobAnswer {
 pub struct JobController {
     pub answer_tx: Sender<JobAnswer>,
     pub cancel_all: Arc<AtomicBool>,
-    /// PID of the `ouch` process currently running, or 0 when none is. The UI
-    /// uses it to terminate the child if the user closes mid-extraction.
-    pub current_pid: Arc<AtomicU32>,
+    /// PID of each worker's `ouch` process, or 0 when that worker is idle. The
+    /// UI terminates every non-zero PID when the user cancels or closes.
+    pub current_pids: Vec<Arc<AtomicU32>>,
 }
 
 /// State the worker's steps share: where to report, how to ask the UI and how
@@ -121,12 +124,12 @@ struct WorkerCtx<'a> {
     events: &'a Sender<JobEvent>,
     /// egui context, used to wake the UI after each event.
     ui: &'a egui::Context,
-    /// Channel the UI answers prompts on.
-    answers: &'a Receiver<JobAnswer>,
+    /// Answers from the UI. The lock is also the prompt gate: a worker holds it
+    /// from emitting a prompt until the answer arrives, so the single prompt
+    /// modal always belongs to the worker that receives the answer.
+    answers: &'a Mutex<Receiver<JobAnswer>>,
     /// Set by the UI when the whole batch must stop.
     cancel: &'a Arc<AtomicBool>,
-    /// PID of the running `ouch` process, or 0 when none is running.
-    pid: &'a Arc<AtomicU32>,
     /// Batch configuration.
     config: &'a Config,
     /// Translations for the messages built here.
@@ -147,56 +150,93 @@ pub fn spawn(
     let (event_tx, event_rx) = mpsc::channel::<JobEvent>();
     let (answer_tx, answer_rx) = mpsc::channel::<JobAnswer>();
     let cancel_all = Arc::new(AtomicBool::new(false));
-    let current_pid = Arc::new(AtomicU32::new(0));
+    let workers = worker_count(&config, archives.len());
+    let current_pids: Vec<Arc<AtomicU32>> =
+        (0..workers).map(|_| Arc::new(AtomicU32::new(0))).collect();
 
     let controller = JobController {
         answer_tx,
         cancel_all: Arc::clone(&cancel_all),
-        current_pid: Arc::clone(&current_pid),
+        current_pids: current_pids.clone(),
     };
 
     thread::spawn(move || {
+        let answers = Mutex::new(answer_rx);
+        let batch_password = Mutex::new(None);
+        let last_destination = Mutex::new(None);
         let worker = WorkerCtx {
             events: &event_tx,
             ui: &ctx,
-            answers: &answer_rx,
+            answers: &answers,
             cancel: &cancel_all,
-            pid: &current_pid,
             config: &config,
             i18n: &i18n,
         };
-        run(&ouch, &archives, &worker);
+        run(
+            &ouch,
+            &archives,
+            &current_pids,
+            &batch_password,
+            &last_destination,
+            &worker,
+        );
     });
 
     (controller, event_rx)
 }
 
-/// Runs the whole batch, one archive at a time.
-fn run(ouch: &OuchClient, archives: &[PathBuf], worker: &WorkerCtx<'_>) {
+/// Number of worker threads for a batch: never more than the archives to
+/// process, and never zero even for a hand-edited config.
+fn worker_count(config: &Config, archives: usize) -> usize {
+    let configured = usize::try_from(
+        config
+            .parallel_extractions
+            .clamp(1, MAX_PARALLEL_EXTRACTIONS),
+    )
+    .unwrap_or(1);
+    configured.min(archives.max(1))
+}
+
+/// Runs the whole batch with a pool of workers pulling archives from a shared
+/// queue, so a slow archive does not hold up the rest.
+fn run(
+    ouch: &OuchClient,
+    archives: &[PathBuf],
+    pids: &[Arc<AtomicU32>],
+    batch_password: &Mutex<Option<String>>,
+    last_destination: &Mutex<Option<PathBuf>>,
+    worker: &WorkerCtx<'_>,
+) {
     let event_tx = worker.events;
     let ui = worker.ui;
-    // Password remembered from the first successful prompt, reused afterwards.
-    let mut batch_password: Option<String> = None;
-    // Last directory chosen by a prompt: the batch destination in
-    // `DestinationMode::AskBatch`, or the previous archive's in `AskEach`.
-    let mut last_destination: Option<PathBuf> = None;
+    let next = AtomicUsize::new(0);
 
-    for (index, archive) in archives.iter().enumerate() {
-        if worker.cancel.load(Ordering::Relaxed) {
-            break;
+    thread::scope(|scope| {
+        for pid in pids {
+            let next = &next;
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(archive) = archives.get(index) else {
+                    break;
+                };
+                if worker.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                send(event_tx, ui, JobEvent::Started { index });
+
+                let event = process_one(
+                    ouch,
+                    archive,
+                    index,
+                    batch_password,
+                    last_destination,
+                    pid,
+                    worker,
+                );
+                send(event_tx, ui, event);
+            });
         }
-        send(event_tx, ui, JobEvent::Started { index });
-
-        let event = process_one(
-            ouch,
-            archive,
-            index,
-            &mut batch_password,
-            &mut last_destination,
-            worker,
-        );
-        send(event_tx, ui, event);
-    }
+    });
 
     send(event_tx, ui, JobEvent::AllDone);
 }
@@ -206,15 +246,15 @@ fn process_one(
     ouch: &OuchClient,
     archive: &Path,
     index: usize,
-    batch_password: &mut Option<String>,
-    last_destination: &mut Option<PathBuf>,
+    batch_password: &Mutex<Option<String>>,
+    last_destination: &Mutex<Option<PathBuf>>,
+    current_pid: &Arc<AtomicU32>,
     worker: &WorkerCtx<'_>,
 ) -> JobEvent {
     let event_tx = worker.events;
     let ctx = worker.ui;
     let answer_rx = worker.answers;
     let cancel_all = worker.cancel;
-    let current_pid = worker.pid;
     let config = worker.config;
     let i18n = worker.i18n;
     if !archive.exists() {
@@ -421,7 +461,11 @@ fn process_one(
     if let Some(found) = password {
         candidates.push(Some(found));
     }
-    if let Some(batch) = batch_password.clone() {
+    let shared_password = batch_password
+        .lock()
+        .expect("password lock poisoned")
+        .clone();
+    if let Some(batch) = shared_password {
         if !candidates.contains(&Some(batch.clone())) {
             candidates.push(Some(batch));
         }
@@ -452,7 +496,7 @@ fn process_one(
         ) {
             Ok(outcome) if outcome.success => {
                 if candidate.is_some() {
-                    *batch_password = candidate;
+                    *batch_password.lock().expect("password lock poisoned") = candidate;
                 }
                 return finish_success(
                     index,
@@ -487,17 +531,21 @@ fn process_one(
         if cancel_all.load(Ordering::Relaxed) {
             return fail(index, "cancelled".into());
         }
-        let _ = send(
-            event_tx,
-            ctx,
-            JobEvent::NeedPassword {
-                index,
-                archive: archive.to_path_buf(),
-                error: (!first_prompt).then(|| last_error.clone()),
-            },
-        );
+        let answer = {
+            let answers = answer_rx.lock().expect("prompt channel poisoned");
+            let _ = send(
+                event_tx,
+                ctx,
+                JobEvent::NeedPassword {
+                    index,
+                    archive: archive.to_path_buf(),
+                    error: (!first_prompt).then(|| last_error.clone()),
+                },
+            );
+            answers.recv().unwrap_or(JobAnswer::CancelBatch)
+        };
         first_prompt = false;
-        match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
+        match answer {
             JobAnswer::Password(password) => {
                 match ouch.decompress(
                     &source,
@@ -508,7 +556,7 @@ fn process_one(
                     &log,
                 ) {
                     Ok(outcome) if outcome.success => {
-                        *batch_password = Some(password);
+                        *batch_password.lock().expect("password lock poisoned") = Some(password);
                         return finish_success(
                             index,
                             archive,
@@ -538,13 +586,15 @@ fn process_one(
 fn resolve_workdir(
     archive: &Path,
     index: usize,
-    last_destination: &mut Option<PathBuf>,
+    last_destination: &Mutex<Option<PathBuf>>,
     worker: &WorkerCtx<'_>,
 ) -> Result<PathBuf, String> {
     let config = worker.config;
-    let suggested = last_destination
-        .clone()
-        .unwrap_or_else(|| absolute(&parent_dir(archive)));
+    let previous = last_destination
+        .lock()
+        .expect("destination lock poisoned")
+        .clone();
+    let suggested = previous.unwrap_or_else(|| absolute(&parent_dir(archive)));
     let dir = match config.destination_mode {
         DestinationMode::ArchiveFolder => return Ok(suggested),
         DestinationMode::Fixed => match config.destination_dir.as_deref() {
@@ -552,19 +602,24 @@ fn resolve_workdir(
             _ => return Err("no destination folder configured in settings".into()),
         },
         DestinationMode::AskBatch => {
-            if let Some(dir) = last_destination.as_ref() {
-                dir.clone()
-            } else {
-                let dir =
-                    prompt_destination(archive, PromptScope::Batch, suggested, index, worker)?;
-                *last_destination = Some(dir.clone());
-                return Ok(dir);
-            }
+            return prompt_destination(
+                archive,
+                PromptScope::Batch,
+                suggested,
+                index,
+                last_destination,
+                worker,
+            );
         }
         DestinationMode::AskEach => {
-            let dir = prompt_destination(archive, PromptScope::Single, suggested, index, worker)?;
-            *last_destination = Some(dir.clone());
-            return Ok(dir);
+            return prompt_destination(
+                archive,
+                PromptScope::Single,
+                suggested,
+                index,
+                last_destination,
+                worker,
+            );
         }
     };
     ensure_directory(dir)
@@ -585,14 +640,28 @@ fn prompt_destination(
     scope: PromptScope,
     suggested: PathBuf,
     index: usize,
+    last_destination: &Mutex<Option<PathBuf>>,
     worker: &WorkerCtx<'_>,
 ) -> Result<PathBuf, String> {
     let event_tx = worker.events;
     let ctx = worker.ui;
-    let answer_rx = worker.answers;
     let cancel_all = worker.cancel;
     let mut suggested = suggested;
     let mut last_error: Option<String> = None;
+
+    // Serialize prompts, then re-check the batch destination: another worker
+    // may have answered while this one was waiting for its turn.
+    let answers = worker.answers.lock().expect("prompt channel poisoned");
+    if scope == PromptScope::Batch {
+        let chosen = last_destination
+            .lock()
+            .expect("destination lock poisoned")
+            .clone();
+        if let Some(dir) = chosen {
+            return Ok(dir);
+        }
+    }
+
     loop {
         if cancel_all.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -608,7 +677,7 @@ fn prompt_destination(
                 error: last_error.take(),
             },
         );
-        match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
+        match answers.recv().unwrap_or(JobAnswer::CancelBatch) {
             JobAnswer::Destination(path) => {
                 if path.as_os_str().is_empty() {
                     last_error = Some("the destination folder is empty".into());
@@ -616,7 +685,11 @@ fn prompt_destination(
                 }
                 let dir = absolute(&path);
                 match ensure_directory(dir.clone()) {
-                    Ok(dir) => return Ok(dir),
+                    Ok(dir) => {
+                        *last_destination.lock().expect("destination lock poisoned") =
+                            Some(dir.clone());
+                        return Ok(dir);
+                    }
                     Err(err) => {
                         suggested = dir;
                         last_error = Some(err);
@@ -717,7 +790,7 @@ fn detect_single_file_conflict(archive: &Path, workdir: &Path) -> Vec<PathBuf> {
 fn apply_conflict_policy(
     conflicts: &[PathBuf],
     config: &Config,
-    answer_rx: &Receiver<JobAnswer>,
+    answers: &Mutex<Receiver<JobAnswer>>,
     event_tx: &Sender<JobEvent>,
     ctx: &egui::Context,
     index: usize,
@@ -738,6 +811,7 @@ fn apply_conflict_policy(
         }
         ConflictPolicy::Rename => rename_conflicts(conflicts),
         ConflictPolicy::Ask => {
+            let answers = answers.lock().expect("prompt channel poisoned");
             let _ = send(
                 event_tx,
                 ctx,
@@ -747,7 +821,7 @@ fn apply_conflict_policy(
                 },
             );
             loop {
-                match answer_rx.recv().unwrap_or(JobAnswer::CancelBatch) {
+                match answers.recv().unwrap_or(JobAnswer::CancelBatch) {
                     JobAnswer::Overwrite => return Ok(()),
                     JobAnswer::Skip => return Err("skipped".into()),
                     JobAnswer::CancelBatch => return Err("cancelled".into()),
@@ -1222,7 +1296,7 @@ fn obtain_listing(
     ouch: &OuchClient,
     archive: &Path,
     index: usize,
-    batch_password: &mut Option<String>,
+    batch_password: &Mutex<Option<String>>,
     worker: &WorkerCtx<'_>,
 ) -> Result<(String, Option<String>), SkipReason> {
     let event_tx = worker.events;
@@ -1232,7 +1306,11 @@ fn obtain_listing(
     let config = worker.config;
     let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
     let mut candidates: Vec<Option<String>> = vec![None];
-    if let Some(batch) = batch_password.clone() {
+    let shared_password = batch_password
+        .lock()
+        .expect("password lock poisoned")
+        .clone();
+    if let Some(batch) = shared_password {
         candidates.push(Some(batch));
     }
     for saved in &config.passwords {
@@ -1253,7 +1331,7 @@ fn obtain_listing(
         match ouch.list(archive, candidate.as_deref(), &log) {
             Ok(listing) => {
                 if candidate.is_some() {
-                    batch_password.clone_from(&candidate);
+                    *batch_password.lock().expect("password lock poisoned") = candidate.clone();
                 }
                 return Ok((listing, candidate));
             }
@@ -1277,23 +1355,29 @@ fn obtain_listing(
         if cancel_all.load(Ordering::Relaxed) {
             return Err(SkipReason::BatchCancelled);
         }
-        let _ = send(
-            event_tx,
-            ctx,
-            JobEvent::NeedPassword {
-                index,
-                archive: archive.to_path_buf(),
-                error: (!first_prompt).then(|| last_error.clone()),
-            },
-        );
-        first_prompt = false;
-
-        let answer = answer_rx.recv().unwrap_or(JobAnswer::CancelBatch);
+        let answer = {
+            let answers = answer_rx.lock().expect("prompt channel poisoned");
+            let _ = send(
+                event_tx,
+                ctx,
+                JobEvent::NeedPassword {
+                    index,
+                    archive: archive.to_path_buf(),
+                    error: (!first_prompt).then(|| last_error.clone()),
+                },
+            );
+            first_prompt = false;
+            answers.recv().unwrap_or(JobAnswer::CancelBatch)
+        };
         match answer {
             JobAnswer::Password(password) => match ouch.list(archive, Some(&password), &log) {
                 Ok(listing) => {
-                    *batch_password = Some(password);
-                    return Ok((listing, batch_password.clone()));
+                    *batch_password.lock().expect("password lock poisoned") = Some(password);
+                    let found = batch_password
+                        .lock()
+                        .expect("password lock poisoned")
+                        .clone();
+                    return Ok((listing, found));
                 }
                 Err(err) => {
                     last_error = err.to_string();
@@ -1347,6 +1431,71 @@ mod tests {
         assert!(looks_like_crash("ouch list failed: signal: 11 (SIGSEGV)"));
         assert!(looks_like_crash("ouch list failed: exit status: 1"));
         assert!(!looks_like_crash("ouch list failed: not a valid archive"));
+    }
+
+    #[test]
+    fn clamps_the_parallel_worker_count() {
+        let config = Config {
+            parallel_extractions: 0,
+            ..Config::default()
+        };
+        assert_eq!(worker_count(&config, 5), 1, "zero workers is invalid");
+
+        let config = Config {
+            parallel_extractions: 3,
+            ..Config::default()
+        };
+        assert_eq!(worker_count(&config, 10), 3);
+        assert_eq!(
+            worker_count(&config, 2),
+            2,
+            "one worker per archive at most"
+        );
+
+        let config = Config {
+            parallel_extractions: 999,
+            ..Config::default()
+        };
+        assert_eq!(worker_count(&config, 100), 16);
+    }
+
+    #[test]
+    fn parallel_batch_extracts_every_archive() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        let base = unique_dir("parallel-batch");
+        let first_dir = base.join("one");
+        let second_dir = base.join("two");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = build_zip(&ouch, &first_dir);
+        let second = build_zip(&ouch, &second_dir);
+
+        let config = Config {
+            parallel_extractions: 2,
+            after_extract: AfterExtract::Keep,
+            ..Config::default()
+        };
+        let (_controller, events) = spawn(
+            ouch,
+            vec![first, second],
+            config,
+            I18n::new(crate::i18n::Language::En),
+            egui::Context::default(),
+        );
+
+        let mut done = 0;
+        loop {
+            match events.recv_timeout(Duration::from_secs(30)) {
+                Ok(JobEvent::Done { success, .. }) => done += usize::from(success),
+                Ok(JobEvent::AllDone) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        assert_eq!(done, 2, "both archives should be extracted");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1483,15 +1632,15 @@ mod tests {
             ..Config::default()
         };
         let (_answer_tx, answer_rx) = mpsc::channel();
+        let answers = Mutex::new(answer_rx);
         let (event_tx, _event_rx) = mpsc::channel();
         let ctx = egui::Context::default();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut last_destination = None;
+        let last_destination = Mutex::new(None);
 
         let i18n = I18n::new(config.language);
-        let pid = Arc::new(AtomicU32::new(0));
-        let worker = test_worker(&config, &i18n, &event_tx, &answer_rx, &cancel, &pid, &ctx);
-        let dir = resolve_workdir(&archive, 0, &mut last_destination, &worker).unwrap();
+        let worker = test_worker(&config, &i18n, &event_tx, &answers, &cancel, &ctx);
+        let dir = resolve_workdir(&archive, 0, &last_destination, &worker).unwrap();
 
         assert_eq!(dir, target);
         assert!(target.is_dir());
@@ -1508,16 +1657,24 @@ mod tests {
         answer_tx
             .send(JobAnswer::Destination(target.clone()))
             .unwrap();
+        let answers = Mutex::new(answer_rx);
         let (event_tx, event_rx) = mpsc::channel();
         let ctx = egui::Context::default();
         let cancel = Arc::new(AtomicBool::new(false));
+        let last_destination = Mutex::new(None);
 
         let config = Config::default();
         let i18n = I18n::new(config.language);
-        let pid = Arc::new(AtomicU32::new(0));
-        let worker = test_worker(&config, &i18n, &event_tx, &answer_rx, &cancel, &pid, &ctx);
-        let dir =
-            prompt_destination(&archive, PromptScope::Single, base.clone(), 0, &worker).unwrap();
+        let worker = test_worker(&config, &i18n, &event_tx, &answers, &cancel, &ctx);
+        let dir = prompt_destination(
+            &archive,
+            PromptScope::Single,
+            base.clone(),
+            0,
+            &last_destination,
+            &worker,
+        )
+        .unwrap();
 
         assert_eq!(dir, target);
         assert!(target.is_dir());
@@ -1535,15 +1692,15 @@ mod tests {
         std::fs::write(&archive, b"x").unwrap();
         let config = Config::default();
         let (_answer_tx, answer_rx) = mpsc::channel();
+        let answers = Mutex::new(answer_rx);
         let (event_tx, _event_rx) = mpsc::channel();
         let ctx = egui::Context::default();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut last_destination = None;
+        let last_destination = Mutex::new(None);
 
         let i18n = I18n::new(config.language);
-        let pid = Arc::new(AtomicU32::new(0));
-        let worker = test_worker(&config, &i18n, &event_tx, &answer_rx, &cancel, &pid, &ctx);
-        let dir = resolve_workdir(&archive, 0, &mut last_destination, &worker).unwrap();
+        let worker = test_worker(&config, &i18n, &event_tx, &answers, &cancel, &ctx);
+        let dir = resolve_workdir(&archive, 0, &last_destination, &worker).unwrap();
 
         assert_eq!(dir, base);
         let _ = std::fs::remove_dir_all(&base);
@@ -1564,18 +1721,18 @@ mod tests {
             ..Config::default()
         };
         let (answer_tx, answer_rx) = mpsc::channel();
+        let answers = Mutex::new(answer_rx);
         let (event_tx, event_rx) = mpsc::channel();
         let ctx = egui::Context::default();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut last_destination = None;
+        let last_destination = Mutex::new(None);
 
         answer_tx
             .send(JobAnswer::Destination(chosen.clone()))
             .unwrap();
         let i18n = I18n::new(config.language);
-        let pid = Arc::new(AtomicU32::new(0));
-        let worker = test_worker(&config, &i18n, &event_tx, &answer_rx, &cancel, &pid, &ctx);
-        let dir = resolve_workdir(&first, 0, &mut last_destination, &worker).unwrap();
+        let worker = test_worker(&config, &i18n, &event_tx, &answers, &cancel, &ctx);
+        let dir = resolve_workdir(&first, 0, &last_destination, &worker).unwrap();
         assert_eq!(dir, chosen);
         let JobEvent::NeedDestination { suggested, .. } = event_rx.try_recv().unwrap() else {
             panic!("expected a destination request");
@@ -1585,7 +1742,7 @@ mod tests {
         answer_tx
             .send(JobAnswer::Destination(chosen.clone()))
             .unwrap();
-        let dir = resolve_workdir(&second, 1, &mut last_destination, &worker).unwrap();
+        let dir = resolve_workdir(&second, 1, &last_destination, &worker).unwrap();
         assert_eq!(dir, chosen);
         let JobEvent::NeedDestination { suggested, .. } = event_rx.try_recv().unwrap() else {
             panic!("expected a destination request");
@@ -1678,9 +1835,8 @@ mod tests {
         config: &'a Config,
         i18n: &'a I18n,
         events: &'a Sender<JobEvent>,
-        answers: &'a Receiver<JobAnswer>,
+        answers: &'a Mutex<Receiver<JobAnswer>>,
         cancel: &'a Arc<AtomicBool>,
-        pid: &'a Arc<AtomicU32>,
         ui: &'a egui::Context,
     ) -> WorkerCtx<'a> {
         WorkerCtx {
@@ -1688,7 +1844,6 @@ mod tests {
             ui,
             answers,
             cancel,
-            pid,
             config,
             i18n,
         }
@@ -1705,13 +1860,15 @@ mod tests {
     ) -> (JobEvent, Vec<JobEvent>) {
         let (event_tx, event_rx) = mpsc::channel();
         let (answer_tx, answer_rx) = mpsc::channel();
-        let mut batch_password = None;
-        let mut last_destination = None;
-        let ctx = egui::Context::default();
 
         for answer in answers {
             let _ = answer_tx.send(answer.clone());
         }
+
+        let answers = Mutex::new(answer_rx);
+        let batch_password = Mutex::new(None);
+        let last_destination = Mutex::new(None);
+        let ctx = egui::Context::default();
 
         let current_pid = Arc::new(AtomicU32::new(0));
         let cancel_all = Arc::new(AtomicBool::new(false));
@@ -1719,9 +1876,8 @@ mod tests {
         let worker = WorkerCtx {
             events: &event_tx,
             ui: &ctx,
-            answers: &answer_rx,
+            answers: &answers,
             cancel: &cancel_all,
-            pid: &current_pid,
             config,
             i18n: &i18n,
         };
@@ -1729,8 +1885,9 @@ mod tests {
             ouch,
             archive,
             0,
-            &mut batch_password,
-            &mut last_destination,
+            &batch_password,
+            &last_destination,
+            &current_pid,
             &worker,
         );
         let events: Vec<JobEvent> = event_rx.try_iter().collect();

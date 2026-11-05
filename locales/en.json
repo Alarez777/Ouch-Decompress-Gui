@@ -63,6 +63,8 @@
   "settings.bulk_passwords.save": "Save",
   "settings.notify": "Notifications",
   "settings.ui_scale": "Interface size",
+  "settings.parallel": "Parallel extractions",
+  "settings.parallel.hint": "Archives extracted at the same time (applies to the next batch).",
   "scale_restart.title": "Restart required",
   "scale_restart.body": "The interface size changed. Restart the app so it applies correctly.",
   "scale_restart.running": "You can restart when the current extraction finishes.",

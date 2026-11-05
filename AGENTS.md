@@ -29,8 +29,8 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
 - `src/app.rs` — UI state and rendering; Settings/Log/About are modal overlays
   inside the main window, which grows to fit them and restores its size when
   they close.
-- `src/job.rs` — background batch extraction worker; talks to the UI only
-  through channels.
+- `src/job.rs` — worker pool that extracts several archives at once; prompts
+  are serialized, and it talks to the UI only through channels.
 - `src/ouch.rs` — the single place that builds `ouch` commands and parses them.
 - `src/modes.rs` — folder/here/smart target selection.
 - `src/formats.rs` — format table and extension/MIME mapping.
@@ -54,8 +54,8 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
   upstream, because it makes the interface unresponsive.
 - The bundled `ouch` is a static-PIE binary, so it must be copied into the
   AppDir *after* `linuxdeploy` runs (see `packaging/build-appimage.sh`).
-- Extraction progress is *estimated*: `ouch` exposes no progress, so the worker
-  polls the child's `/proc/<pid>/io` `rchar` and divides it by the archive size
+- Extraction progress is *estimated*: `ouch` exposes no progress, so each worker
+  polls its child's `/proc/<pid>/io` `rchar` and divides it by the archive size
   (`src/job.rs`). Keep it best-effort and Linux-only.
 
 ## Rust quality bar

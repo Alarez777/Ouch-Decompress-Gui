@@ -63,6 +63,8 @@
   "settings.bulk_passwords.save": "Guardar",
   "settings.notify": "Notificaciones",
   "settings.ui_scale": "Tamaño de la interfaz",
+  "settings.parallel": "Extracciones en paralelo",
+  "settings.parallel.hint": "Archivos que se extraen a la vez (se aplica al siguiente lote).",
   "scale_restart.title": "Reinicio necesario",
   "scale_restart.body": "El tamaño de la interfaz cambió. Reinicia la app para que se aplique correctamente.",
   "scale_restart.running": "Podrás reiniciar cuando termine la extracción actual.",
