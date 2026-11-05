@@ -999,17 +999,22 @@ impl App {
         }
     }
 
-    /// Flags the batch as cancelled and answers any pending password prompt.
+    /// Flags the batch as cancelled and answers any pending prompt.
     fn signal_cancel(&mut self) {
         if let Some(controller) = &self.controller {
             controller
                 .cancel_all
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = controller.answer_tx.send(JobAnswer::CancelBatch);
+            // One answer per worker: several may be queued behind the active
+            // prompt, and each needs an answer to leave its wait.
+            for _ in 0..controller.current_pids.len() {
+                let _ = controller.answer_tx.send(JobAnswer::CancelBatch);
+            }
         }
         self.password_prompt = None;
         self.password_input.clear();
         self.destination_prompt = None;
+        self.overwrite_prompt = None;
     }
 
     fn current_child_pids(&self) -> Vec<u32> {
@@ -2580,9 +2585,12 @@ impl App {
         });
 
         if let Some(answer) = answer {
-            self.overwrite_prompt = None;
-            if let Some(controller) = &self.controller {
-                let _ = controller.answer_tx.send(answer);
+            match answer {
+                JobAnswer::CancelBatch => self.cancel_batch(),
+                answer => {
+                    self.overwrite_prompt = None;
+                    self.send_answer(answer);
+                }
             }
         }
     }

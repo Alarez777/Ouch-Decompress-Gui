@@ -376,9 +376,9 @@ fn process_one(
     // configured conflict policy still applies to the produced file.
     if !kind.is_archive() {
         let conflicts = detect_single_file_conflict(archive, &workdir);
-        if let Err(message) =
-            apply_conflict_policy(&conflicts, config, answer_rx, event_tx, ctx, index)
-        {
+        if let Err(message) = apply_conflict_policy(
+            &conflicts, config, answer_rx, cancel_all, event_tx, ctx, index,
+        ) {
             return fail(index, message);
         }
         let result = result_name(archive, kind, None);
@@ -406,7 +406,15 @@ fn process_one(
         DecompressMode::Here => Target::Here,
     };
 
-    match obtain_listing(ouch, &source, index, batch_password, worker) {
+    match obtain_listing(
+        ouch,
+        &source,
+        &workdir,
+        index,
+        batch_password,
+        current_pid,
+        worker,
+    ) {
         Ok((text, found)) => {
             password = found;
             if config.decompress_mode == DecompressMode::Smart {
@@ -440,9 +448,9 @@ fn process_one(
     // Handle existing destinations according to the configured policy.
     if let Some(text) = &listing {
         let conflicts = detect_conflicts(archive, target, text, &workdir);
-        if let Err(message) =
-            apply_conflict_policy(&conflicts, config, answer_rx, event_tx, ctx, index)
-        {
+        if let Err(message) = apply_conflict_policy(
+            &conflicts, config, answer_rx, cancel_all, event_tx, ctx, index,
+        ) {
             return fail(index, message);
         }
     }
@@ -465,6 +473,7 @@ fn process_one(
         .lock()
         .expect("password lock poisoned")
         .clone();
+    let mut tried_shared = shared_password.clone();
     if let Some(batch) = shared_password {
         if !candidates.contains(&Some(batch.clone())) {
             candidates.push(Some(batch));
@@ -521,18 +530,93 @@ fn process_one(
         }
     }
 
+    // Try a shared password again before showing another dialog: the old
+    // candidate list may predate the password another worker just found.
+    let attempt = |candidate: &str| match ouch.decompress(
+        &source,
+        &workdir,
+        target,
+        Some(candidate),
+        current_pid,
+        &log,
+    ) {
+        Ok(outcome) if outcome.success => Ok(()),
+        Ok(outcome) => Err(outcome_message(&outcome)),
+        Err(err) => Err(err.to_string()),
+    };
+    let succeed = || {
+        finish_success(
+            index,
+            archive,
+            &cleanup_parts,
+            target.label(),
+            result.as_deref(),
+            worker,
+        )
+    };
+
     if !password_related {
-        return fail(index, last_error);
+        // A missing password can produce an error that never mentions
+        // passwords, so retry a password shared after the candidates were
+        // built before reporting a hard failure.
+        if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+            match attempt(&shared) {
+                Ok(()) => return succeed(),
+                Err(err) => {
+                    last_error = err;
+                    password_related = is_password_error(&last_error);
+                }
+            }
+        }
+        if !password_related {
+            return fail(index, last_error);
+        }
     }
 
     // Ask the user, retrying until a password works or the user skips/cancels.
+    // The prompt turn stays locked while the password is tested, so an invalid
+    // one never reaches the rest of the batch.
     let mut first_prompt = true;
     loop {
         if cancel_all.load(Ordering::Relaxed) {
             return fail(index, "cancelled".into());
         }
-        let answer = {
-            let answers = answer_rx.lock().expect("prompt channel poisoned");
+
+        // Another worker may have shared a validated password while this one
+        // was extracting; try it before showing another dialog.
+        if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+            match attempt(&shared) {
+                Ok(()) => return succeed(),
+                Err(err) => {
+                    // A shared password is only one more guess; if it fails,
+                    // ask the user instead of giving up. A wrong password can
+                    // produce an error that never mentions passwords.
+                    last_error = err;
+                    continue;
+                }
+            }
+        }
+
+        let answers = answer_rx.lock().expect("prompt channel poisoned");
+        if cancel_all.load(Ordering::Relaxed) {
+            return fail(index, "cancelled".into());
+        }
+        // The shared password may have changed while this worker waited for
+        // its prompt turn; re-check it before asking.
+        if has_new_shared_password(batch_password, &tried_shared) {
+            drop(answers);
+            continue;
+        }
+
+        loop {
+            // A validated password may have been shared while this worker was
+            // re-prompting; use it instead of asking again.
+            if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+                match attempt(&shared) {
+                    Ok(()) => return succeed(),
+                    Err(err) => last_error = err,
+                }
+            }
             let _ = send(
                 event_tx,
                 ctx,
@@ -542,42 +626,62 @@ fn process_one(
                     error: (!first_prompt).then(|| last_error.clone()),
                 },
             );
-            answers.recv().unwrap_or(JobAnswer::CancelBatch)
-        };
-        first_prompt = false;
-        match answer {
-            JobAnswer::Password(password) => {
-                match ouch.decompress(
-                    &source,
-                    &workdir,
-                    target,
-                    Some(&password),
-                    current_pid,
-                    &log,
-                ) {
-                    Ok(outcome) if outcome.success => {
-                        *batch_password.lock().expect("password lock poisoned") = Some(password);
-                        return finish_success(
-                            index,
-                            archive,
-                            &cleanup_parts,
-                            target.label(),
-                            result.as_deref(),
-                            worker,
-                        );
+            first_prompt = false;
+            match answers.recv().unwrap_or(JobAnswer::CancelBatch) {
+                JobAnswer::Password(password) => {
+                    // Validate while holding the turn: a wrong password must
+                    // not be shared with the rest of the batch.
+                    log_line(
+                        event_tx,
+                        ctx,
+                        index,
+                        "checking password with a trial extraction".into(),
+                    );
+                    match validate_password(ouch, &source, &workdir, &password, index, current_pid)
+                    {
+                        Ok(()) => {
+                            if cancel_all.load(Ordering::Relaxed) {
+                                return fail(index, "cancelled".into());
+                            }
+                            *batch_password.lock().expect("password lock poisoned") =
+                                Some(password.clone());
+                            match attempt(&password) {
+                                Ok(()) => {
+                                    if cancel_all.load(Ordering::Relaxed) {
+                                        return fail(index, "cancelled".into());
+                                    }
+                                    drop(answers);
+                                    return succeed();
+                                }
+                                Err(err) => {
+                                    last_error = err;
+                                    if !is_password_error(&last_error) {
+                                        return fail(index, last_error);
+                                    }
+                                    if cancel_all.load(Ordering::Relaxed) {
+                                        return fail(index, "cancelled".into());
+                                    }
+                                    // A validated password that still fails to
+                                    // extract is reported through the prompt.
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if cancel_all.load(Ordering::Relaxed) {
+                                return fail(index, "cancelled".into());
+                            }
+                            last_error = err;
+                            if !is_password_error(&last_error) {
+                                return fail(index, last_error);
+                            }
+                            // Keep the turn and ask again.
+                        }
                     }
-                    Ok(outcome) => last_error = outcome_message(&outcome),
-                    Err(err) => last_error = err.to_string(),
                 }
-                // A failure that is no longer password-related (disk full,
-                // permissions, corrupt data) must be reported, not re-prompted.
-                if !is_password_error(&last_error) {
-                    return fail(index, last_error);
-                }
+                JobAnswer::Skip => return fail(index, "skipped".into()),
+                JobAnswer::CancelBatch => return fail(index, "cancelled".into()),
+                JobAnswer::Overwrite | JobAnswer::Destination(_) => {}
             }
-            JobAnswer::Skip => return fail(index, "skipped".into()),
-            JobAnswer::CancelBatch => return fail(index, "cancelled".into()),
-            JobAnswer::Overwrite | JobAnswer::Destination(_) => {}
         }
     }
 }
@@ -652,6 +756,9 @@ fn prompt_destination(
     // Serialize prompts, then re-check the batch destination: another worker
     // may have answered while this one was waiting for its turn.
     let answers = worker.answers.lock().expect("prompt channel poisoned");
+    if cancel_all.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
     if scope == PromptScope::Batch {
         let chosen = last_destination
             .lock()
@@ -791,6 +898,7 @@ fn apply_conflict_policy(
     conflicts: &[PathBuf],
     config: &Config,
     answers: &Mutex<Receiver<JobAnswer>>,
+    cancel: &Arc<AtomicBool>,
     event_tx: &Sender<JobEvent>,
     ctx: &egui::Context,
     index: usize,
@@ -812,6 +920,9 @@ fn apply_conflict_policy(
         ConflictPolicy::Rename => rename_conflicts(conflicts),
         ConflictPolicy::Ask => {
             let answers = answers.lock().expect("prompt channel poisoned");
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
             let _ = send(
                 event_tx,
                 ctx,
@@ -1286,6 +1397,68 @@ enum SkipReason {
     HardError(String),
 }
 
+/// True when the batch password is set and this archive has not tried it yet.
+fn has_new_shared_password(batch_password: &Mutex<Option<String>>, tried: &Option<String>) -> bool {
+    batch_password
+        .lock()
+        .expect("password lock poisoned")
+        .as_deref()
+        .is_some_and(|shared| tried.as_deref() != Some(shared))
+}
+
+/// Returns the batch password when this archive has not tried it yet, marking
+/// it as tried so a failed attempt does not repeat on every retry.
+fn take_new_shared_password(
+    batch_password: &Mutex<Option<String>>,
+    tried: &mut Option<String>,
+) -> Option<String> {
+    let shared = batch_password
+        .lock()
+        .expect("password lock poisoned")
+        .clone()?;
+    if tried.as_deref() == Some(shared.as_str()) {
+        return None;
+    }
+    *tried = Some(shared.clone());
+    Some(shared)
+}
+
+/// Extracts `archive` into a throwaway directory to check that `password`
+/// decrypts its data, then removes the directory.
+///
+/// `ouch list` cannot validate formats whose file names are not encrypted, so
+/// a real extraction is the only reliable check before the destination is
+/// touched.
+fn validate_password(
+    ouch: &OuchClient,
+    archive: &Path,
+    workdir: &Path,
+    password: &str,
+    index: usize,
+    pid: &AtomicU32,
+) -> Result<(), String> {
+    let temp = workdir.join(format!(".ouch-decompress-gui-validate-{index}"));
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir_all(&temp).map_err(|err| format!("creating {}: {err}", temp.display()))?;
+    let _cleanup = TempDir(temp.clone());
+
+    let log = |_line: &str| {};
+    match ouch.decompress(archive, &temp, Target::Here, Some(password), pid, &log) {
+        Ok(outcome) if outcome.success => Ok(()),
+        Ok(outcome) => Err(outcome_message(&outcome)),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Removes a throwaway directory when it goes out of scope.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Tries to list an archive using, in order: no password, the batch password,
 /// then every saved password. If a password is required — or `ouch` crashes,
 /// which may hide an encrypted archive — it asks the user until a password
@@ -1295,8 +1468,10 @@ enum SkipReason {
 fn obtain_listing(
     ouch: &OuchClient,
     archive: &Path,
+    workdir: &Path,
     index: usize,
     batch_password: &Mutex<Option<String>>,
+    pid: &AtomicU32,
     worker: &WorkerCtx<'_>,
 ) -> Result<(String, Option<String>), SkipReason> {
     let event_tx = worker.events;
@@ -1310,6 +1485,7 @@ fn obtain_listing(
         .lock()
         .expect("password lock poisoned")
         .clone();
+    let mut tried_shared = shared_password.clone();
     if let Some(batch) = shared_password {
         candidates.push(Some(batch));
     }
@@ -1329,12 +1505,7 @@ fn obtain_listing(
             return Err(SkipReason::BatchCancelled);
         }
         match ouch.list(archive, candidate.as_deref(), &log) {
-            Ok(listing) => {
-                if candidate.is_some() {
-                    *batch_password.lock().expect("password lock poisoned") = candidate.clone();
-                }
-                return Ok((listing, candidate));
-            }
+            Ok(listing) => return Ok((listing, candidate)),
             Err(err) => {
                 last_error = err.to_string();
                 if is_password_error(&last_error) {
@@ -1347,7 +1518,21 @@ fn obtain_listing(
     // A crash may hide an encrypted archive that `ouch list` cannot describe
     // without the password, so it is worth offering the password prompt.
     if !password_related && !looks_like_crash(&last_error) {
-        return Err(SkipReason::HardError(last_error));
+        // The candidate list may predate a password shared by another worker,
+        // and a missing password can produce an error that never mentions
+        // passwords. Try the shared one before reporting a hard failure.
+        if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+            match ouch.list(archive, Some(&shared), &log) {
+                Ok(listing) => return Ok((listing, Some(shared))),
+                Err(err) => {
+                    last_error = err.to_string();
+                    password_related = is_password_error(&last_error);
+                }
+            }
+        }
+        if !password_related && !looks_like_crash(&last_error) {
+            return Err(SkipReason::HardError(last_error));
+        }
     }
 
     let mut first_prompt = true;
@@ -1355,8 +1540,41 @@ fn obtain_listing(
         if cancel_all.load(Ordering::Relaxed) {
             return Err(SkipReason::BatchCancelled);
         }
-        let answer = {
-            let answers = answer_rx.lock().expect("prompt channel poisoned");
+        // Another worker may have shared a validated password while this one
+        // was trying its own candidates; test it before asking the user again.
+        if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+            match ouch.list(archive, Some(&shared), &log) {
+                Ok(listing) => return Ok((listing, Some(shared))),
+                Err(err) => {
+                    // A shared password is only one more guess; if it fails,
+                    // ask the user instead of giving up. A wrong password can
+                    // produce an error that never mentions passwords.
+                    last_error = err.to_string();
+                    continue;
+                }
+            }
+        }
+
+        let answers = answer_rx.lock().expect("prompt channel poisoned");
+        if cancel_all.load(Ordering::Relaxed) {
+            return Err(SkipReason::BatchCancelled);
+        }
+        // The shared password may have changed while this worker waited for
+        // its prompt turn; re-check it before asking.
+        if has_new_shared_password(batch_password, &tried_shared) {
+            drop(answers);
+            continue;
+        }
+
+        loop {
+            // A validated password may have been shared while this worker was
+            // re-prompting; use it instead of asking again.
+            if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+                match ouch.list(archive, Some(&shared), &log) {
+                    Ok(listing) => return Ok((listing, Some(shared))),
+                    Err(err) => last_error = err.to_string(),
+                }
+            }
             let _ = send(
                 event_tx,
                 ctx,
@@ -1367,28 +1585,59 @@ fn obtain_listing(
                 },
             );
             first_prompt = false;
-            answers.recv().unwrap_or(JobAnswer::CancelBatch)
-        };
-        match answer {
-            JobAnswer::Password(password) => match ouch.list(archive, Some(&password), &log) {
-                Ok(listing) => {
-                    *batch_password.lock().expect("password lock poisoned") = Some(password);
-                    let found = batch_password
-                        .lock()
-                        .expect("password lock poisoned")
-                        .clone();
-                    return Ok((listing, found));
-                }
-                Err(err) => {
-                    last_error = err.to_string();
-                    if !is_password_error(&last_error) {
-                        return Err(SkipReason::HardError(last_error));
+            match answers.recv().unwrap_or(JobAnswer::CancelBatch) {
+                JobAnswer::Password(password) => {
+                    // Validate while holding the turn: a wrong password must
+                    // not be shared with the rest of the batch.
+                    match ouch.list(archive, Some(&password), &log) {
+                        Ok(listing) => {
+                            if cancel_all.load(Ordering::Relaxed) {
+                                return Err(SkipReason::BatchCancelled);
+                            }
+                            log_line(
+                                event_tx,
+                                ctx,
+                                index,
+                                "checking password with a trial extraction".into(),
+                            );
+                            match validate_password(ouch, archive, workdir, &password, index, pid) {
+                                Ok(()) => {
+                                    if cancel_all.load(Ordering::Relaxed) {
+                                        return Err(SkipReason::BatchCancelled);
+                                    }
+                                    *batch_password.lock().expect("password lock poisoned") =
+                                        Some(password.clone());
+                                    drop(answers);
+                                    return Ok((listing, Some(password)));
+                                }
+                                Err(err) => {
+                                    if cancel_all.load(Ordering::Relaxed) {
+                                        return Err(SkipReason::BatchCancelled);
+                                    }
+                                    last_error = err;
+                                    if !is_password_error(&last_error) {
+                                        return Err(SkipReason::HardError(last_error));
+                                    }
+                                    // Keep the turn and ask again.
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if cancel_all.load(Ordering::Relaxed) {
+                                return Err(SkipReason::BatchCancelled);
+                            }
+                            last_error = err.to_string();
+                            if !is_password_error(&last_error) {
+                                return Err(SkipReason::HardError(last_error));
+                            }
+                            // Keep the turn and ask again.
+                        }
                     }
                 }
-            },
-            JobAnswer::Skip => return Err(SkipReason::Cancelled),
-            JobAnswer::CancelBatch => return Err(SkipReason::BatchCancelled),
-            JobAnswer::Overwrite | JobAnswer::Destination(_) => {}
+                JobAnswer::Skip => return Err(SkipReason::Cancelled),
+                JobAnswer::CancelBatch => return Err(SkipReason::BatchCancelled),
+                JobAnswer::Overwrite | JobAnswer::Destination(_) => {}
+            }
         }
     }
 }
@@ -2230,6 +2479,267 @@ mod tests {
         }
         assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"hello");
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tracks_new_shared_passwords() {
+        let shared = Mutex::new(None);
+        let mut tried = None;
+        assert!(!has_new_shared_password(&shared, &tried));
+        assert_eq!(take_new_shared_password(&shared, &mut tried), None);
+
+        *shared.lock().unwrap() = Some("one".into());
+        assert!(has_new_shared_password(&shared, &tried));
+        assert_eq!(
+            take_new_shared_password(&shared, &mut tried).as_deref(),
+            Some("one")
+        );
+        assert!(!has_new_shared_password(&shared, &tried));
+        assert_eq!(take_new_shared_password(&shared, &mut tried), None);
+
+        *shared.lock().unwrap() = Some("two".into());
+        assert!(has_new_shared_password(&shared, &tried));
+        assert_eq!(
+            take_new_shared_password(&shared, &mut tried).as_deref(),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_a_wrong_password_before_extracting() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        if Command::new("zip").arg("--version").output().is_err() {
+            eprintln!("skipping: `zip` tool not found");
+            return;
+        }
+
+        let base = unique_dir("validate-password");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("secret.txt"), b"secret").unwrap();
+        let archive = out.join("secret.zip");
+        assert!(
+            Command::new("zip")
+                .current_dir(&out)
+                .args(["-q", "-P", "hunter2", "secret.zip", "secret.txt"])
+                .status()
+                .unwrap()
+                .success(),
+            "could not create the encrypted zip"
+        );
+        let workdir = base.join("extract");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let pid = AtomicU32::new(0);
+
+        let err = validate_password(&ouch, &archive, &workdir, "wrong", 0, &pid)
+            .expect_err("a wrong password must fail validation");
+        assert!(is_password_error(&err), "unexpected error: {err}");
+        assert!(
+            std::fs::read_dir(&workdir).unwrap().next().is_none(),
+            "a failed validation must not leave files in the destination"
+        );
+
+        validate_password(&ouch, &archive, &workdir, "hunter2", 0, &pid)
+            .expect("the correct password should pass validation");
+        assert!(
+            std::fs::read_dir(&workdir).unwrap().next().is_none(),
+            "validation must remove its temporary directory"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validation_catches_a_wrong_password_for_seven_zip() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        if Command::new("7z").arg("--help").output().is_err() {
+            eprintln!("skipping: `7z` tool not found");
+            return;
+        }
+
+        let base = unique_dir("validate-7z");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("secret.txt"), b"secret").unwrap();
+        let archive = out.join("secret.7z");
+        assert!(
+            Command::new("7z")
+                .current_dir(&out)
+                .args([
+                    "a",
+                    "-y",
+                    "-phunter2",
+                    "-mhe=off",
+                    "secret.7z",
+                    "secret.txt"
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "could not create the encrypted 7z"
+        );
+        let workdir = base.join("extract");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let pid = AtomicU32::new(0);
+
+        // `ouch list` accepts a wrong password when the file names are not
+        // encrypted, which is why validation needs a real trial extraction.
+        ouch.list(&archive, Some("wrong"), &|_line: &str| {})
+            .expect("7z without header encryption lists with a wrong password");
+
+        let err = validate_password(&ouch, &archive, &workdir, "wrong", 0, &pid)
+            .expect_err("a wrong password must fail the trial extraction");
+        assert!(is_password_error(&err), "unexpected error: {err}");
+        assert!(
+            std::fs::read_dir(&workdir).unwrap().next().is_none(),
+            "a failed validation must not leave files in the destination"
+        );
+
+        validate_password(&ouch, &archive, &workdir, "hunter2", 0, &pid)
+            .expect("the correct password should pass validation");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn password_is_shared_between_parallel_workers() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        if Command::new("zip").arg("--version").output().is_err() {
+            eprintln!("skipping: `zip` tool not found");
+            return;
+        }
+
+        let base = unique_dir("parallel-password");
+        let mut archives = Vec::new();
+        for folder in ["one", "two"] {
+            let out = base.join(folder).join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(out.join("secret.txt"), b"secret").unwrap();
+            let archive = out.join("secret.zip");
+            assert!(
+                Command::new("zip")
+                    .current_dir(&out)
+                    .args(["-q", "-P", "hunter2", "secret.zip", "secret.txt"])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "could not create the encrypted zip"
+            );
+            archives.push(archive);
+        }
+
+        let config = Config {
+            parallel_extractions: 2,
+            after_extract: AfterExtract::Keep,
+            conflict_policy: ConflictPolicy::Overwrite,
+            ..Config::default()
+        };
+        let (controller, events) = spawn(
+            ouch,
+            archives,
+            config,
+            I18n::new(crate::i18n::Language::En),
+            egui::Context::default(),
+        );
+
+        let mut prompts = 0;
+        let mut done = 0;
+        loop {
+            match events.recv_timeout(Duration::from_secs(30)) {
+                Ok(JobEvent::NeedPassword { .. }) => {
+                    prompts += 1;
+                    let _ = controller
+                        .answer_tx
+                        .send(JobAnswer::Password("hunter2".into()));
+                }
+                Ok(JobEvent::Done { success, .. }) => done += usize::from(success),
+                Ok(JobEvent::AllDone) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+
+        assert_eq!(prompts, 1, "the password should be asked only once");
+        assert_eq!(done, 2, "both archives should use the shared password");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cancel_stops_workers_waiting_for_a_prompt() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        if Command::new("zip").arg("--version").output().is_err() {
+            eprintln!("skipping: `zip` tool not found");
+            return;
+        }
+
+        let base = unique_dir("parallel-cancel");
+        let mut archives = Vec::new();
+        for folder in ["one", "two"] {
+            let out = base.join(folder).join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(out.join("secret.txt"), b"secret").unwrap();
+            let archive = out.join("secret.zip");
+            assert!(
+                Command::new("zip")
+                    .current_dir(&out)
+                    .args(["-q", "-P", "hunter2", "secret.zip", "secret.txt"])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "could not create the encrypted zip"
+            );
+            archives.push(archive);
+        }
+
+        let config = Config {
+            parallel_extractions: 2,
+            after_extract: AfterExtract::Keep,
+            conflict_policy: ConflictPolicy::Overwrite,
+            ..Config::default()
+        };
+        let (controller, events) = spawn(
+            ouch,
+            archives,
+            config,
+            I18n::new(crate::i18n::Language::En),
+            egui::Context::default(),
+        );
+
+        let mut prompts = 0;
+        let mut all_done = false;
+        loop {
+            match events.recv_timeout(Duration::from_secs(10)) {
+                Ok(JobEvent::NeedPassword { .. }) => {
+                    prompts += 1;
+                    if prompts == 1 {
+                        // Give the other worker time to queue behind the
+                        // active prompt before cancelling.
+                        std::thread::sleep(Duration::from_millis(100));
+                        controller.cancel_all.store(true, Ordering::Relaxed);
+                    }
+                    let _ = controller.answer_tx.send(JobAnswer::CancelBatch);
+                }
+                Ok(JobEvent::AllDone) => {
+                    all_done = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(all_done, "the batch should finish after cancelling");
+        assert_eq!(prompts, 1, "waiting workers must not reopen the prompt");
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -12,7 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Archives are now extracted in parallel. Settings → General has a new
   **Parallel extractions** spinbox (default 3, maximum 16) that sets how many
   archives are unpacked at the same time. Passwords and destination prompts are
-  shared and shown one at a time, and each archive gets its own progress bar.
+  shared and shown one at a time, and a password is validated with a trial
+  extraction and reused only after an archive accepts it. Each archive gets its
+  own progress bar.
 
 ## [0.3.2] - 2026-11-01
 
