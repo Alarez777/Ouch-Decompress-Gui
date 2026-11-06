@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -130,10 +130,59 @@ struct WorkerCtx<'a> {
     answers: &'a Mutex<Receiver<JobAnswer>>,
     /// Set by the UI when the whole batch must stop.
     cancel: &'a Arc<AtomicBool>,
+    /// Keeps the other workers behind the first archive until its password
+    /// phase is resolved, so the first prompt is for the first queued file.
+    startup_gate: Option<&'a StartupGate>,
     /// Batch configuration.
     config: &'a Config,
     /// Translations for the messages built here.
     i18n: &'a I18n,
+}
+
+/// Keeps the other workers behind the first archive until it has resolved its
+/// password phase, so the first prompt belongs to the first queued archive.
+struct StartupGate {
+    open: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl StartupGate {
+    fn new() -> Self {
+        Self {
+            open: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Blocks until the gate opens or the batch is cancelled.
+    fn wait(&self, cancel: &AtomicBool) {
+        let mut open = self.open.lock().expect("startup gate poisoned");
+        while !*open && !cancel.load(Ordering::Relaxed) {
+            let (guard, _) = self
+                .cv
+                .wait_timeout(open, Duration::from_millis(100))
+                .expect("startup gate poisoned");
+            open = guard;
+        }
+    }
+
+    fn open(&self) {
+        *self.open.lock().expect("startup gate poisoned") = true;
+        self.cv.notify_all();
+    }
+
+    fn guard(&self) -> StartupGateGuard<'_> {
+        StartupGateGuard(self)
+    }
+}
+
+/// Opens the gate when dropped, so an early return cannot leave workers stuck.
+struct StartupGateGuard<'a>(&'a StartupGate);
+
+impl Drop for StartupGateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.open();
+    }
 }
 
 /// Spawns the extraction worker.
@@ -161,6 +210,7 @@ pub fn spawn(
     };
 
     thread::spawn(move || {
+        let startup_gate = StartupGate::new();
         let answers = Mutex::new(answer_rx);
         let batch_password = Mutex::new(None);
         let last_destination = Mutex::new(None);
@@ -169,6 +219,7 @@ pub fn spawn(
             ui: &ctx,
             answers: &answers,
             cancel: &cancel_all,
+            startup_gate: Some(&startup_gate),
             config: &config,
             i18n: &i18n,
         };
@@ -178,6 +229,7 @@ pub fn spawn(
             &current_pids,
             &batch_password,
             &last_destination,
+            &startup_gate,
             &worker,
         );
     });
@@ -205,6 +257,7 @@ fn run(
     pids: &[Arc<AtomicU32>],
     batch_password: &Mutex<Option<String>>,
     last_destination: &Mutex<Option<PathBuf>>,
+    startup_gate: &StartupGate,
     worker: &WorkerCtx<'_>,
 ) {
     let event_tx = worker.events;
@@ -219,6 +272,11 @@ fn run(
                 let Some(archive) = archives.get(index) else {
                     break;
                 };
+                // The first archive resolves its password alone, so the first
+                // prompt is deterministic; the rest wait for its gate.
+                if index != 0 {
+                    startup_gate.wait(worker.cancel);
+                }
                 if worker.cancel.load(Ordering::Relaxed) {
                     break;
                 }
@@ -257,6 +315,13 @@ fn process_one(
     let cancel_all = worker.cancel;
     let config = worker.config;
     let i18n = worker.i18n;
+    // The first archive owns the startup gate; the guard opens it on every
+    // early return (missing file, missing parts, cancellation).
+    let _startup_gate = if index == 0 {
+        worker.startup_gate.map(StartupGate::guard)
+    } else {
+        None
+    };
     if !archive.exists() {
         return JobEvent::Done {
             index,
@@ -375,6 +440,11 @@ fn process_one(
     // password; unpack straight into the destination directory. The
     // configured conflict policy still applies to the produced file.
     if !kind.is_archive() {
+        if index == 0 {
+            if let Some(gate) = worker.startup_gate {
+                gate.open();
+            }
+        }
         let conflicts = detect_single_file_conflict(archive, &workdir);
         if let Err(message) = apply_conflict_policy(
             &conflicts, config, answer_rx, cancel_all, event_tx, ctx, index,
@@ -442,6 +512,11 @@ fn process_one(
                     line: message,
                 },
             );
+        }
+    }
+    if index == 0 {
+        if let Some(gate) = worker.startup_gate {
+            gate.open();
         }
     }
 
@@ -2079,6 +2154,32 @@ mod tests {
         archive
     }
 
+    /// Builds an encrypted 7z fixture with data encryption but plain file names,
+    /// the case where `ouch list` accepts a wrong password.
+    fn build_encrypted_7z(base: &Path, folder: &str) -> PathBuf {
+        let out = base.join(folder).join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("secret.txt"), b"secret").unwrap();
+        let archive = out.join("secret.7z");
+        assert!(
+            Command::new("7z")
+                .current_dir(&out)
+                .args([
+                    "a",
+                    "-y",
+                    "-phunter2",
+                    "-mhe=off",
+                    "secret.7z",
+                    "secret.txt"
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "could not create the encrypted 7z"
+        );
+        archive
+    }
+
     /// Wires a worker context around the locals a test already owns.
     fn test_worker<'a>(
         config: &'a Config,
@@ -2093,6 +2194,7 @@ mod tests {
             ui,
             answers,
             cancel,
+            startup_gate: None,
             config,
             i18n,
         }
@@ -2127,6 +2229,7 @@ mod tests {
             ui: &ctx,
             answers: &answers,
             cancel: &cancel_all,
+            startup_gate: None,
             config,
             i18n: &i18n,
         };
@@ -2740,6 +2843,128 @@ mod tests {
 
         assert!(all_done, "the batch should finish after cancelling");
         assert_eq!(prompts, 1, "waiting workers must not reopen the prompt");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn first_prompt_is_for_the_first_archive() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        if Command::new("7z").arg("--help").output().is_err() {
+            eprintln!("skipping: `7z` tool not found");
+            return;
+        }
+
+        let base = unique_dir("prompt-order");
+        let archives: Vec<PathBuf> = ["one", "two", "three"]
+            .iter()
+            .map(|folder| build_encrypted_7z(&base, folder))
+            .collect();
+        let config = Config {
+            parallel_extractions: 3,
+            after_extract: AfterExtract::Keep,
+            conflict_policy: ConflictPolicy::Overwrite,
+            ..Config::default()
+        };
+        let (controller, events) = spawn(
+            ouch,
+            archives.clone(),
+            config,
+            I18n::new(crate::i18n::Language::En),
+            egui::Context::default(),
+        );
+
+        let mut first_prompt = None;
+        let mut prompts = 0;
+        let mut done = 0;
+        loop {
+            match events.recv_timeout(Duration::from_secs(30)) {
+                Ok(JobEvent::NeedPassword { archive, .. }) => {
+                    prompts += 1;
+                    if first_prompt.is_none() {
+                        first_prompt = Some(archive);
+                    }
+                    let _ = controller
+                        .answer_tx
+                        .send(JobAnswer::Password("hunter2".into()));
+                }
+                Ok(JobEvent::Done { success, .. }) => done += usize::from(success),
+                Ok(JobEvent::AllDone) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+
+        assert_eq!(
+            first_prompt.as_deref(),
+            Some(archives[0].as_path()),
+            "the first password prompt must belong to the first queued archive"
+        );
+        assert_eq!(prompts, 1, "the shared password should avoid more prompts");
+        assert_eq!(done, 3, "all archives should be extracted");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cancel_stops_a_seven_zip_batch() {
+        let Ok(ouch) = OuchClient::discover() else {
+            eprintln!("skipping: ouch binary not found");
+            return;
+        };
+        if Command::new("7z").arg("--help").output().is_err() {
+            eprintln!("skipping: `7z` tool not found");
+            return;
+        }
+
+        let base = unique_dir("cancel-7z");
+        let archives: Vec<PathBuf> = ["one", "two", "three", "four", "five", "six"]
+            .iter()
+            .map(|folder| build_encrypted_7z(&base, folder))
+            .collect();
+        let config = Config {
+            parallel_extractions: 2,
+            after_extract: AfterExtract::Keep,
+            conflict_policy: ConflictPolicy::Overwrite,
+            ..Config::default()
+        };
+        let (controller, events) = spawn(
+            ouch,
+            archives,
+            config,
+            I18n::new(crate::i18n::Language::En),
+            egui::Context::default(),
+        );
+
+        let mut prompts = 0;
+        let mut started = 0;
+        let mut all_done = false;
+        loop {
+            match events.recv_timeout(Duration::from_secs(10)) {
+                Ok(JobEvent::NeedPassword { .. }) => {
+                    prompts += 1;
+                    if prompts == 1 {
+                        controller.cancel_all.store(true, Ordering::Relaxed);
+                        for _ in 0..controller.current_pids.len() {
+                            let _ = controller.answer_tx.send(JobAnswer::CancelBatch);
+                        }
+                    } else {
+                        let _ = controller.answer_tx.send(JobAnswer::CancelBatch);
+                    }
+                }
+                Ok(JobEvent::Started { .. }) => started += 1,
+                Ok(JobEvent::AllDone) => {
+                    all_done = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(all_done, "the batch must finish after cancelling");
+        assert_eq!(prompts, 1, "waiting workers must not reopen the prompt");
+        assert_eq!(started, 1, "only the first archive should have started");
         let _ = std::fs::remove_dir_all(&base);
     }
 

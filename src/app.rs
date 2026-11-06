@@ -273,6 +273,9 @@ pub struct App {
     log: Vec<String>,
     status_line: StatusLine,
     running: bool,
+    /// Set when the user cancels, so pending files are not mistaken for files
+    /// added while the batch was running.
+    cancel_requested: bool,
     controller: Option<JobController>,
     event_rx: Option<Receiver<JobEvent>>,
     password_prompt: Option<PasswordPrompt>,
@@ -404,6 +407,7 @@ impl App {
             log: Vec::new(),
             status_line: StatusLine::default(),
             running: false,
+            cancel_requested: false,
             controller: None,
             event_rx: None,
             password_prompt: None,
@@ -523,6 +527,7 @@ impl App {
         self.controller = Some(controller);
         self.event_rx = Some(rx);
         self.batch_indices = pending;
+        self.cancel_requested = false;
         self.running = true;
     }
 
@@ -819,7 +824,14 @@ impl App {
                 self.controller = None;
                 self.event_rx = None;
                 self.confirm_close = false;
-                self.status_line = StatusLine::info(self.i18n.t("extract.all_done"));
+                if self.cancel_requested {
+                    mark_cancelled_pending(&mut self.files);
+                }
+                self.status_line = if self.cancel_requested {
+                    StatusLine::info(self.i18n.t("extract.cancelled"))
+                } else {
+                    StatusLine::info(self.i18n.t("extract.all_done"))
+                };
 
                 let done = self
                     .files
@@ -831,12 +843,13 @@ impl App {
                     .iter()
                     .filter(|file| file.status == Status::Failed)
                     .count();
-                let notify = match self.config.notifications {
-                    // Nothing was processed (all skipped): stay quiet.
-                    Notifications::Always => done > 0 || failed > 0,
-                    Notifications::OnFailure => failed > 0,
-                    Notifications::Never => false,
-                };
+                let notify = !self.cancel_requested
+                    && match self.config.notifications {
+                        // Nothing was processed (all skipped): stay quiet.
+                        Notifications::Always => done > 0 || failed > 0,
+                        Notifications::OnFailure => failed > 0,
+                        Notifications::Never => false,
+                    };
                 if notify {
                     // Only mention the failures when there are any.
                     let mut body = if failed == 0 {
@@ -883,6 +896,7 @@ impl App {
                 if self.auto_close_on_success && all_ok {
                     self.close_requested = true;
                 }
+                self.cancel_requested = false;
             }
         }
     }
@@ -1001,6 +1015,7 @@ impl App {
 
     /// Flags the batch as cancelled and answers any pending prompt.
     fn signal_cancel(&mut self) {
+        self.cancel_requested = true;
         if let Some(controller) = &self.controller {
             controller
                 .cancel_all
@@ -2754,6 +2769,16 @@ fn spin_arrow(ui: &mut egui::Ui, direction: SpinDirection) -> bool {
     response.clicked()
 }
 
+/// Marks archives that never started when the batch was cancelled.
+fn mark_cancelled_pending(files: &mut [FileEntry]) {
+    for file in files {
+        if file.status == Status::Pending {
+            file.status = Status::Skipped;
+            file.message = "cancelled".into();
+        }
+    }
+}
+
 /// Formats a number of seconds as `M:SS`.
 fn format_duration(total_secs: u64) -> String {
     let minutes = total_secs / 60;
@@ -2840,6 +2865,34 @@ mod tests {
         });
         output.textures_delta.clear();
         assert_eq!(seen, 1, "dropped file should be visible in input.raw");
+    }
+
+    #[test]
+    fn cancelled_batch_marks_pending_files_as_skipped() {
+        let mut files = vec![
+            FileEntry {
+                path: PathBuf::from("pending.zip"),
+                parts: Vec::new(),
+                status: Status::Pending,
+                message: String::new(),
+                progress: FileProgress::default(),
+                started_at: None,
+            },
+            FileEntry {
+                path: PathBuf::from("done.zip"),
+                parts: Vec::new(),
+                status: Status::Done,
+                message: String::new(),
+                progress: FileProgress::default(),
+                started_at: None,
+            },
+        ];
+
+        mark_cancelled_pending(&mut files);
+
+        assert_eq!(files[0].status, Status::Skipped);
+        assert_eq!(files[0].message, "cancelled");
+        assert_eq!(files[1].status, Status::Done, "finished files stay done");
     }
 
     #[test]

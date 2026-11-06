@@ -11,6 +11,7 @@
   "extract.open_folder": "Abrir directorio",
   "extract.working": "Extrayendo...",
   "extract.all_done": "Todos los archivos procesados.",
+  "extract.cancelled": "Extracción cancelada.",
   "extract.parts": "{count} partes",
   "extract.joining": "Uniendo partes…",
   "extract.joining_bar": "UNIENDO",
