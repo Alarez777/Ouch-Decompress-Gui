@@ -57,6 +57,10 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
 - Extraction progress is *estimated*: `ouch` exposes no progress, so each worker
   polls its child's `/proc/<pid>/io` `rchar` and divides it by the archive size
   (`src/job.rs`). Keep it best-effort and Linux-only.
+- Archive extractions go to a hidden temporary directory inside the destination
+  and are only moved into place on success (`move_extracted` in `src/job.rs`),
+  so a wrong password or a failed extraction cannot leave partial files. Do not
+  extract archives directly into the destination.
 
 ## Rust quality bar
 
