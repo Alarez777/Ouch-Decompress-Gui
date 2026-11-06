@@ -212,7 +212,7 @@ pub fn spawn(
     thread::spawn(move || {
         let startup_gate = StartupGate::new();
         let answers = Mutex::new(answer_rx);
-        let batch_password = Mutex::new(None);
+        let batch_password = Mutex::new(Vec::new());
         let last_destination = Mutex::new(None);
         let worker = WorkerCtx {
             events: &event_tx,
@@ -255,7 +255,7 @@ fn run(
     ouch: &OuchClient,
     archives: &[PathBuf],
     pids: &[Arc<AtomicU32>],
-    batch_password: &Mutex<Option<String>>,
+    batch_password: &Mutex<Vec<String>>,
     last_destination: &Mutex<Option<PathBuf>>,
     startup_gate: &StartupGate,
     worker: &WorkerCtx<'_>,
@@ -314,7 +314,7 @@ fn process_one(
     ouch: &OuchClient,
     archive: &Path,
     index: usize,
-    batch_password: &Mutex<Option<String>>,
+    batch_password: &Mutex<Vec<String>>,
     last_destination: &Mutex<Option<PathBuf>>,
     current_pid: &Arc<AtomicU32>,
     worker: &WorkerCtx<'_>,
@@ -550,14 +550,15 @@ fn process_one(
         // before wasting a full attempt with the batch password.
         candidates.push(None);
     }
-    let shared_password = batch_password
+    let batch_passwords = batch_password
         .lock()
         .expect("password lock poisoned")
         .clone();
-    let mut tried_shared = shared_password.clone();
-    if let Some(batch) = shared_password {
-        if !candidates.contains(&Some(batch.clone())) {
-            candidates.push(Some(batch));
+    let mut tried_batch = batch_passwords.clone();
+    for password in &batch_passwords {
+        let candidate = Some(password.clone());
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
     for saved in &config.passwords {
@@ -598,7 +599,7 @@ fn process_one(
         }
         move_extracted(temp.path(), &workdir)?;
         if let Some(password) = candidate {
-            *batch_password.lock().expect("password lock poisoned") = Some(password.to_owned());
+            remember_batch_password(batch_password, password);
         }
         if index == 0 {
             if let Some(gate) = worker.startup_gate {
@@ -640,7 +641,7 @@ fn process_one(
         // A missing password can produce an error that never mentions
         // passwords, so retry a password shared after the candidates were
         // built before reporting a hard failure.
-        if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+        if let Some(shared) = take_new_batch_password(batch_password, &mut tried_batch) {
             match try_candidate(Some(&shared)) {
                 CandidateOutcome::Done => return succeed(),
                 CandidateOutcome::Rejected(err) => {
@@ -667,7 +668,7 @@ fn process_one(
 
         // Another worker may have shared a validated password while this one
         // was extracting; try it before showing another dialog.
-        if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+        if let Some(shared) = take_new_batch_password(batch_password, &mut tried_batch) {
             match try_candidate(Some(&shared)) {
                 CandidateOutcome::Done => return succeed(),
                 CandidateOutcome::Rejected(err) => {
@@ -687,7 +688,7 @@ fn process_one(
             }
             // The shared password may have changed while this worker waited
             // for its prompt turn; re-check it before asking.
-            if has_new_shared_password(batch_password, tried_shared.as_deref()) {
+            if has_new_batch_password(batch_password, &tried_batch) {
                 drop(answers);
                 continue;
             }
@@ -1437,30 +1438,37 @@ enum SkipReason {
     HardError(String),
 }
 
-/// True when the batch password is set and this archive has not tried it yet.
-fn has_new_shared_password(batch_password: &Mutex<Option<String>>, tried: Option<&str>) -> bool {
+/// Adds a validated password to the batch, keeping discovery order.
+fn remember_batch_password(batch_password: &Mutex<Vec<String>>, password: &str) {
+    let mut passwords = batch_password.lock().expect("password lock poisoned");
+    if !passwords.iter().any(|saved| saved.as_str() == password) {
+        passwords.push(password.to_owned());
+    }
+}
+
+/// True when the batch has a password this archive has not tried yet.
+fn has_new_batch_password(batch_password: &Mutex<Vec<String>>, tried: &[String]) -> bool {
     batch_password
         .lock()
         .expect("password lock poisoned")
-        .as_deref()
-        .is_some_and(|shared| tried != Some(shared))
+        .iter()
+        .any(|password| !tried.contains(password))
 }
 
-/// Returns the batch password when this archive has not tried it yet, marking
-/// it as tried so a failed attempt does not repeat on every retry.
-fn take_new_shared_password(
-    batch_password: &Mutex<Option<String>>,
-    tried: &mut Option<String>,
+/// Returns the first batch password this archive has not tried yet, marking it
+/// as tried so a failed attempt does not repeat on every retry.
+fn take_new_batch_password(
+    batch_password: &Mutex<Vec<String>>,
+    tried: &mut Vec<String>,
 ) -> Option<String> {
-    let shared = batch_password
-        .lock()
-        .expect("password lock poisoned")
-        .clone()?;
-    if tried.as_deref() == Some(shared.as_str()) {
-        return None;
-    }
-    *tried = Some(shared.clone());
-    Some(shared)
+    let passwords = batch_password.lock().expect("password lock poisoned");
+    let password = passwords
+        .iter()
+        .find(|password| !tried.contains(*password))?
+        .clone();
+    drop(passwords);
+    tried.push(password.clone());
+    Some(password)
 }
 
 /// Extracts one archive into a throwaway directory inside `workdir`.
@@ -1595,7 +1603,7 @@ fn obtain_listing(
     ouch: &OuchClient,
     archive: &Path,
     index: usize,
-    batch_password: &Mutex<Option<String>>,
+    batch_password: &Mutex<Vec<String>>,
     worker: &WorkerCtx<'_>,
 ) -> Result<(String, Option<String>), SkipReason> {
     let event_tx = worker.events;
@@ -1605,13 +1613,16 @@ fn obtain_listing(
     let config = worker.config;
     let log = |line: &str| log_line(event_tx, ctx, index, line.to_string());
     let mut candidates: Vec<Option<String>> = vec![None];
-    let shared_password = batch_password
+    let batch_passwords = batch_password
         .lock()
         .expect("password lock poisoned")
         .clone();
-    let mut tried_shared = shared_password.clone();
-    if let Some(batch) = shared_password {
-        candidates.push(Some(batch));
+    let mut tried_batch = batch_passwords.clone();
+    for password in &batch_passwords {
+        let candidate = Some(password.clone());
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
     }
     for saved in &config.passwords {
         if !candidates
@@ -1645,7 +1656,7 @@ fn obtain_listing(
         // The candidate list may predate a password shared by another worker,
         // and a missing password can produce an error that never mentions
         // passwords. Try the shared one before reporting a hard failure.
-        if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+        if let Some(shared) = take_new_batch_password(batch_password, &mut tried_batch) {
             match ouch.list(archive, Some(&shared), &log) {
                 Ok(listing) => return Ok((listing, Some(shared))),
                 Err(err) => {
@@ -1666,7 +1677,7 @@ fn obtain_listing(
         }
         // Another worker may have shared a validated password while this one
         // was trying its own candidates; test it before asking the user again.
-        if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+        if let Some(shared) = take_new_batch_password(batch_password, &mut tried_batch) {
             match ouch.list(archive, Some(&shared), &log) {
                 Ok(listing) => return Ok((listing, Some(shared))),
                 Err(err) => {
@@ -1685,7 +1696,7 @@ fn obtain_listing(
         }
         // The shared password may have changed while this worker waited for
         // its prompt turn; re-check it before asking.
-        if has_new_shared_password(batch_password, tried_shared.as_deref()) {
+        if has_new_batch_password(batch_password, &tried_batch) {
             drop(answers);
             continue;
         }
@@ -1693,7 +1704,7 @@ fn obtain_listing(
         loop {
             // A validated password may have been shared while this worker was
             // re-prompting; use it instead of asking again.
-            if let Some(shared) = take_new_shared_password(batch_password, &mut tried_shared) {
+            if let Some(shared) = take_new_batch_password(batch_password, &mut tried_batch) {
                 match ouch.list(archive, Some(&shared), &log) {
                     Ok(listing) => return Ok((listing, Some(shared))),
                     Err(err) => last_error = err.to_string(),
@@ -2236,7 +2247,7 @@ mod tests {
         }
 
         let answers = Mutex::new(answer_rx);
-        let batch_password = Mutex::new(None);
+        let batch_password = Mutex::new(Vec::new());
         let last_destination = Mutex::new(None);
         let ctx = egui::Context::default();
 
@@ -2605,27 +2616,30 @@ mod tests {
     }
 
     #[test]
-    fn tracks_new_shared_passwords() {
-        let shared = Mutex::new(None);
-        let mut tried = None;
-        assert!(!has_new_shared_password(&shared, tried.as_deref()));
-        assert_eq!(take_new_shared_password(&shared, &mut tried), None);
+    fn tracks_validated_batch_passwords() {
+        let batch = Mutex::new(Vec::new());
+        let mut tried = Vec::new();
+        assert!(!has_new_batch_password(&batch, &tried));
+        assert_eq!(take_new_batch_password(&batch, &mut tried), None);
 
-        *shared.lock().unwrap() = Some("one".into());
-        assert!(has_new_shared_password(&shared, tried.as_deref()));
+        remember_batch_password(&batch, "one");
+        assert!(has_new_batch_password(&batch, &tried));
         assert_eq!(
-            take_new_shared_password(&shared, &mut tried).as_deref(),
+            take_new_batch_password(&batch, &mut tried).as_deref(),
             Some("one")
         );
-        assert!(!has_new_shared_password(&shared, tried.as_deref()));
-        assert_eq!(take_new_shared_password(&shared, &mut tried), None);
+        assert!(!has_new_batch_password(&batch, &tried));
+        assert_eq!(take_new_batch_password(&batch, &mut tried), None);
 
-        *shared.lock().unwrap() = Some("two".into());
-        assert!(has_new_shared_password(&shared, tried.as_deref()));
+        remember_batch_password(&batch, "two");
+        remember_batch_password(&batch, "one");
+        assert!(has_new_batch_password(&batch, &tried));
         assert_eq!(
-            take_new_shared_password(&shared, &mut tried).as_deref(),
+            take_new_batch_password(&batch, &mut tried).as_deref(),
             Some("two")
         );
+        assert!(!has_new_batch_password(&batch, &tried));
+        assert_eq!(batch.lock().unwrap().len(), 2, "duplicates are ignored");
     }
 
     #[test]
@@ -3048,7 +3062,7 @@ mod tests {
     }
 
     #[test]
-    fn different_passwords_are_asked_per_archive() {
+    fn validated_passwords_are_reused_across_archives() {
         let Ok(ouch) = OuchClient::discover() else {
             eprintln!("skipping: ouch binary not found");
             return;
@@ -3059,13 +3073,18 @@ mod tests {
         }
 
         let base = unique_dir("mixed-passwords");
-        let archives: Vec<PathBuf> = [("one", "hunter2"), ("two", "other")]
-            .iter()
-            .map(|(folder, password)| build_encrypted_7z(&base, folder, password))
-            .collect();
+        let archives: Vec<PathBuf> = [
+            ("a1", "alpha"),
+            ("b1", "beta"),
+            ("a2", "alpha"),
+            ("b2", "beta"),
+        ]
+        .iter()
+        .map(|(folder, password)| build_encrypted_7z(&base, folder, password))
+        .collect();
 
         let config = Config {
-            parallel_extractions: 2,
+            parallel_extractions: 1,
             after_extract: AfterExtract::Keep,
             conflict_policy: ConflictPolicy::Overwrite,
             ..Config::default()
@@ -3084,10 +3103,10 @@ mod tests {
             match events.recv_timeout(Duration::from_secs(30)) {
                 Ok(JobEvent::NeedPassword { archive, .. }) => {
                     prompts += 1;
-                    let password = if archive.to_string_lossy().contains("/one/") {
-                        "hunter2"
+                    let password = if archive.to_string_lossy().contains("/b") {
+                        "beta"
                     } else {
-                        "other"
+                        "alpha"
                     };
                     let _ = controller
                         .answer_tx
@@ -3099,10 +3118,17 @@ mod tests {
             }
         }
 
-        assert_eq!(prompts, 2, "each archive needs its own password");
-        assert_eq!(done, 2, "both archives should be extracted");
-        assert!(base.join("one/out/secret.txt").is_file());
-        assert!(base.join("two/out/secret.txt").is_file());
+        assert_eq!(
+            prompts, 2,
+            "each distinct password should be asked only once"
+        );
+        assert_eq!(done, 4, "all archives should be extracted");
+        for folder in ["a1", "a2", "b1", "b2"] {
+            assert!(
+                base.join(folder).join("out/secret.txt").is_file(),
+                "{folder} should have been extracted"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

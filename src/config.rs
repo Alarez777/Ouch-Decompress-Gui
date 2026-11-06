@@ -237,7 +237,7 @@ impl Default for Config {
             decompress_mode: DecompressMode::Smart,
             destination_mode: DestinationMode::ArchiveFolder,
             destination_dir: None,
-            parallel_extractions: 3,
+            parallel_extractions: 4,
             passwords: Vec::new(),
             password_sort: PasswordSort::Alphabetical,
             disabled_formats: Vec::new(),
@@ -417,9 +417,9 @@ mod tests {
     }
 
     #[test]
-    fn parallel_extractions_default_to_three() {
+    fn parallel_extractions_default_to_four() {
         let config: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.parallel_extractions, 3);
+        assert_eq!(config.parallel_extractions, 4);
     }
 
     #[test]
