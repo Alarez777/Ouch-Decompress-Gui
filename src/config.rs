@@ -12,6 +12,9 @@ use crate::theme::ThemeChoice;
 /// Directory name used under the user's config dir.
 pub const APP_DIR: &str = "ouch-decompress-gui";
 
+/// Upper bound for the configurable number of archives extracted at once.
+pub const MAX_PARALLEL_EXTRACTIONS: u32 = 16;
+
 /// What to do when the destination already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -166,6 +169,10 @@ pub struct Config {
     pub destination_mode: DestinationMode,
     /// Base directory used by [`DestinationMode::Fixed`].
     pub destination_dir: Option<PathBuf>,
+    /// How many archives are extracted at the same time. Clamped to
+    /// `1..=MAX_PARALLEL_EXTRACTIONS` when the batch starts, so a hand-edited
+    /// config cannot spawn an unreasonable number of processes.
+    pub parallel_extractions: u32,
     /// Passwords tried automatically, in order. Stored in plain text on
     /// purpose; the UI warns the user about this.
     pub passwords: Vec<String>,
@@ -230,6 +237,7 @@ impl Default for Config {
             decompress_mode: DecompressMode::Smart,
             destination_mode: DestinationMode::ArchiveFolder,
             destination_dir: None,
+            parallel_extractions: 4,
             passwords: Vec::new(),
             password_sort: PasswordSort::Alphabetical,
             disabled_formats: Vec::new(),
@@ -332,6 +340,7 @@ mod tests {
             trash_fallback: TrashFallback::Nothing,
             destination_mode: DestinationMode::Fixed,
             destination_dir: Some(PathBuf::from("/tmp/extracted")),
+            parallel_extractions: 7,
             ui_scale: 150,
             passwords: vec!["secret".into()],
             ..Config::default()
@@ -349,6 +358,7 @@ mod tests {
             loaded.destination_dir,
             Some(PathBuf::from("/tmp/extracted"))
         );
+        assert_eq!(loaded.parallel_extractions, 7);
         assert_eq!(loaded.ui_scale, 150);
         assert_eq!(loaded.passwords, vec!["secret".to_string()]);
 
@@ -404,6 +414,12 @@ mod tests {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.destination_mode, DestinationMode::ArchiveFolder);
         assert_eq!(config.destination_dir, None);
+    }
+
+    #[test]
+    fn parallel_extractions_default_to_four() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.parallel_extractions, 4);
     }
 
     #[test]

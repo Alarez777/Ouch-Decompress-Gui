@@ -20,10 +20,12 @@ The intended workflow is the one you already use in your file manager:
    **select several archives and press Enter** (i.e. "Open with" this app) to
    extract them all in one batch.
 
-If an archive is password-protected, the app asks for the password, remembers
-it for the rest of the batch, and retries automatically on the following
-archives. Everything is written in Rust and ships as a small self-contained
-AppImage.
+If an archive is password-protected, the app asks for the password and
+remembers it for the rest of the batch. Every distinct password is tried on the
+remaining archives before asking again, and each archive is extracted into a
+hidden temporary directory and moved into place only when it succeeds, so a
+wrong password never leaves partial files. Everything is written in Rust and
+ships as a small self-contained AppImage.
 
 ## Features
 
@@ -31,6 +33,9 @@ AppImage.
   bundled `ouch` tool — no runtime and no Electron.
 - Extract archives by double-clicking them, or by opening several at once
   (native file-manager integration).
+- Extract several archives in parallel. The **Parallel extractions** setting
+  accepts 1–16 workers (default 4), and each archive gets its own progress bar,
+  speed and ETA.
 - Multiple extraction strategies:
   - **Always create a subdirectory** named after the archive.
   - **Always extract into the root of the source directory**.
@@ -43,8 +48,12 @@ AppImage.
   - **Ask for every file**, before extracting each archive.
   The extraction strategy above is applied inside the chosen destination.
 - Password handling: saved passwords are tried automatically, otherwise the
-  app prompts and reuses the first working password for the whole batch. The
-  prompt only shows an error after a wrong password.
+  app prompts. Prompts are shown one at a time, and every distinct password that
+  works is remembered and tried on the remaining archives before asking again.
+  Each archive is extracted into a hidden temporary directory inside the
+  destination first, so a wrong password or a failed extraction never leaves
+  partial files; only a complete extraction is moved into place. The prompt only
+  shows an error after a wrong password.
 - Overwrite handling: ask, overwrite, rename with numbering, or skip.
 - After a successful extraction the source archive can be moved to the trash,
   deleted permanently, or kept (default: trash). If the filesystem has no
@@ -96,12 +105,16 @@ manager (double-click / select several and press Enter).
 `ouch` is **not** usable as a library (it is a binary-only crate), so this app
 runs the bundled `ouch` executable as a subprocess:
 
-- `ouch list -A -q <archive>` is used to validate passwords and to drive the
-  **Smart** extraction mode (it counts the archive's root entries).
-- `ouch decompress` performs the actual extraction, using either the native
-  stem-named directory behavior or `--here`, relative to the selected
-  destination (the archive's parent directory by default).
-- Passwords are passed with `-p`; `ouch` never prompts on its own.
+- `ouch list -A -q <archive>` drives the **Smart** extraction mode (it counts
+  the archive's root entries) and acts as a first filter for passwords. It is
+  not a reliable password check for every format, so it is not trusted on its
+  own.
+- `ouch decompress` extracts each archive into a hidden temporary directory
+  inside the selected destination, using either the native stem-named directory
+  behavior or `--here`. Only a successful extraction is moved into place; a
+  failed one is discarded, so the real destination is never left half-written.
+- Passwords are passed with `-p`; `ouch` never prompts on its own. The app tries
+  the saved passwords and every password validated during the batch.
 
 ## Building
 

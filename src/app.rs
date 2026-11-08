@@ -1,5 +1,6 @@
 //! Application state and egui rendering.
 
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -8,6 +9,7 @@ use std::thread;
 
 use crate::config::{
     AfterExtract, Config, ConflictPolicy, Notifications, PasswordSort, TrashFallback,
+    MAX_PARALLEL_EXTRACTIONS,
 };
 use crate::formats;
 use crate::i18n::I18n;
@@ -26,6 +28,16 @@ const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x30, 0x25);
 /// How long the interface-size slider must stay still before the restart hint
 /// is shown, so dragging it does not open the modal on every step.
 const SCALE_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Width of the number field in the parallel-extractions spinbox, in points.
+const SPINBOX_WIDTH: f32 = 72.0;
+
+/// Direction of a [`spinbox_u32`] arrow.
+#[derive(Debug, Clone, Copy)]
+enum SpinDirection {
+    Up,
+    Down,
+}
 
 /// Tabs inside the settings window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +167,17 @@ impl Status {
     }
 }
 
+/// Progress of one queued archive, updated by its worker.
+#[derive(Debug, Clone, Copy, Default)]
+struct FileProgress {
+    fraction: f32,
+    total: u64,
+    part_index: usize,
+    speed_bps: u64,
+    eta_secs: u64,
+    joining: bool,
+}
+
 /// One queued archive.
 struct FileEntry {
     path: PathBuf,
@@ -162,6 +185,9 @@ struct FileEntry {
     parts: Vec<PathBuf>,
     status: Status,
     message: String,
+    progress: FileProgress,
+    /// When the worker started this archive, for the per-file elapsed label.
+    started_at: Option<std::time::Instant>,
 }
 
 /// Pending password request from the worker.
@@ -247,6 +273,9 @@ pub struct App {
     log: Vec<String>,
     status_line: StatusLine,
     running: bool,
+    /// Set when the user cancels, so pending files are not mistaken for files
+    /// added while the batch was running.
+    cancel_requested: bool,
     controller: Option<JobController>,
     event_rx: Option<Receiver<JobEvent>>,
     password_prompt: Option<PasswordPrompt>,
@@ -295,19 +324,6 @@ pub struct App {
     results: Vec<String>,
     /// Set when a batch finished but more files were added meanwhile.
     restart_pending: bool,
-    /// Progress of the archive currently being extracted:
-    /// `(fraction, total_bytes, part_index)`. `total == 0` means unknown, so
-    /// the bar is shown as indeterminate.
-    progress: (f32, u64, usize),
-    /// Smoothed write rate of the archive being extracted, in bytes per second.
-    write_speed: u64,
-    /// Estimated seconds left for the archive being extracted (`0` = unknown).
-    eta_secs: u64,
-    /// True while the current archive is being prepared (split parts joined)
-    /// rather than extracted.
-    joining: bool,
-    /// When the current batch started, for the elapsed-time label.
-    batch_started: Option<std::time::Instant>,
 }
 
 /// What the app shows once the window is up.
@@ -391,6 +407,7 @@ impl App {
             log: Vec::new(),
             status_line: StatusLine::default(),
             running: false,
+            cancel_requested: false,
             controller: None,
             event_rx: None,
             password_prompt: None,
@@ -417,11 +434,6 @@ impl App {
             cleanup_failures: 0,
             results: Vec::new(),
             restart_pending: false,
-            progress: (0.0, 0, 0),
-            write_speed: 0,
-            eta_secs: 0,
-            joining: false,
-            batch_started: None,
         };
 
         // A corrupt config must be visible: stderr goes nowhere in an AppImage.
@@ -497,16 +509,14 @@ impl App {
         for &index in &pending {
             self.files[index].status = Status::Pending;
             self.files[index].message.clear();
+            self.files[index].progress = FileProgress::default();
+            self.files[index].started_at = None;
         }
         self.log.clear();
         self.status_line.clear();
         self.error_popup = None;
         self.cleanup_failures = 0;
         self.results.clear();
-        self.progress = (0.0, 0, 0);
-        self.write_speed = 0;
-        self.eta_secs = 0;
-        self.batch_started = Some(std::time::Instant::now());
 
         let archives: Vec<PathBuf> = pending
             .iter()
@@ -517,6 +527,7 @@ impl App {
         self.controller = Some(controller);
         self.event_rx = Some(rx);
         self.batch_indices = pending;
+        self.cancel_requested = false;
         self.running = true;
     }
 
@@ -674,24 +685,30 @@ impl App {
     fn handle_event(&mut self, event: JobEvent) {
         match event {
             JobEvent::Started { index } => {
-                if let Some(file_index) = self.file_index(index) {
-                    self.files[file_index].status = Status::Running;
-                    self.push_log(format!("-> {}", self.file_name(file_index)));
+                let file_index = self.file_index(index);
+                let name = file_index.map(|file_index| self.file_name(file_index));
+                if let Some(file_index) = file_index {
+                    let file = &mut self.files[file_index];
+                    file.status = Status::Running;
+                    file.progress = FileProgress::default();
+                    file.started_at = Some(std::time::Instant::now());
                 }
-                self.progress = (0.0, 0, 0);
-                self.write_speed = 0;
-                self.eta_secs = 0;
-                self.joining = false;
+                if let Some(name) = name {
+                    self.push_log(format!("-> {name}"));
+                }
                 self.status_line = StatusLine::info(self.i18n.t("extract.working"));
             }
             JobEvent::Log { index, line } => {
-                let _ = index;
-                self.push_log(line);
+                let entry = match self.file_index(index) {
+                    Some(file_index) => format!("[{}] {line}", self.file_name(file_index)),
+                    None => line,
+                };
+                self.push_log(entry);
             }
             JobEvent::Joining { index, active } => {
                 if let Some(file_index) = self.file_index(index) {
                     if self.files[file_index].status == Status::Running {
-                        self.joining = active;
+                        self.files[file_index].progress.joining = active;
                     }
                 }
             }
@@ -704,10 +721,13 @@ impl App {
                 eta_secs,
             } => {
                 if let Some(file_index) = self.file_index(index) {
-                    if self.files[file_index].status == Status::Running {
-                        self.progress = (fraction, total, part_index);
-                        self.write_speed = speed_bps;
-                        self.eta_secs = eta_secs;
+                    let file = &mut self.files[file_index];
+                    if file.status == Status::Running {
+                        file.progress.fraction = fraction;
+                        file.progress.total = total;
+                        file.progress.part_index = part_index;
+                        file.progress.speed_bps = speed_bps;
+                        file.progress.eta_secs = eta_secs;
                     }
                 }
             }
@@ -765,6 +785,8 @@ impl App {
             } => {
                 let skipped = message == "skipped" || message == "cancelled";
                 if let Some(file_index) = self.file_index(index) {
+                    let failure = (!success && !skipped)
+                        .then(|| format!("{}: {message}", self.file_name(file_index)));
                     let file = &mut self.files[file_index];
                     file.status = if success {
                         Status::Done
@@ -775,9 +797,7 @@ impl App {
                     };
                     file.message.clone_from(&message);
 
-                    if !success && !skipped {
-                        let name = self.file_name(file_index);
-                        let entry = format!("{name}: {message}");
+                    if let Some(entry) = failure {
                         match &mut self.error_popup {
                             Some(existing) => {
                                 existing.push('\n');
@@ -786,9 +806,9 @@ impl App {
                             None => self.error_popup = Some(entry),
                         }
                     }
-                }
-                if success && self.progress.1 > 0 {
-                    self.progress.0 = 1.0;
+                    if success && file.progress.total > 0 {
+                        file.progress.fraction = 1.0;
+                    }
                 }
                 self.push_log(format!("   {message}"));
                 if let Some(result) = result {
@@ -803,13 +823,15 @@ impl App {
                 self.running = false;
                 self.controller = None;
                 self.event_rx = None;
-                self.progress = (0.0, 0, 0);
-                self.write_speed = 0;
-                self.eta_secs = 0;
-                self.joining = false;
-                self.batch_started = None;
                 self.confirm_close = false;
-                self.status_line = StatusLine::info(self.i18n.t("extract.all_done"));
+                if self.cancel_requested {
+                    mark_cancelled_pending(&mut self.files);
+                }
+                self.status_line = if self.cancel_requested {
+                    StatusLine::info(self.i18n.t("extract.cancelled"))
+                } else {
+                    StatusLine::info(self.i18n.t("extract.all_done"))
+                };
 
                 let done = self
                     .files
@@ -821,12 +843,13 @@ impl App {
                     .iter()
                     .filter(|file| file.status == Status::Failed)
                     .count();
-                let notify = match self.config.notifications {
-                    // Nothing was processed (all skipped): stay quiet.
-                    Notifications::Always => done > 0 || failed > 0,
-                    Notifications::OnFailure => failed > 0,
-                    Notifications::Never => false,
-                };
+                let notify = !self.cancel_requested
+                    && match self.config.notifications {
+                        // Nothing was processed (all skipped): stay quiet.
+                        Notifications::Always => done > 0 || failed > 0,
+                        Notifications::OnFailure => failed > 0,
+                        Notifications::Never => false,
+                    };
                 if notify {
                     // Only mention the failures when there are any.
                     let mut body = if failed == 0 {
@@ -873,6 +896,7 @@ impl App {
                 if self.auto_close_on_success && all_ok {
                     self.close_requested = true;
                 }
+                self.cancel_requested = false;
             }
         }
     }
@@ -907,6 +931,8 @@ impl App {
             parts,
             status: Status::Pending,
             message: String::new(),
+            progress: FileProgress::default(),
+            started_at: None,
         });
         Some(primary)
     }
@@ -975,41 +1001,55 @@ impl App {
 
     fn cancel_batch(&mut self) {
         self.signal_cancel();
-        // Stop the running `ouch` immediately; do it off the UI thread so the
-        // window does not freeze while the child is terminated.
-        let pid = self.current_child_pid();
-        if pid != 0 {
-            std::thread::spawn(move || crate::system::terminate_process(pid));
+        // Stop the running `ouch` processes immediately; do it off the UI
+        // thread so the window does not freeze while they are terminated.
+        let pids = self.current_child_pids();
+        if !pids.is_empty() {
+            std::thread::spawn(move || {
+                for pid in pids {
+                    crate::system::terminate_process(pid);
+                }
+            });
         }
     }
 
-    /// Flags the batch as cancelled and answers any pending password prompt.
+    /// Flags the batch as cancelled and answers any pending prompt.
     fn signal_cancel(&mut self) {
+        self.cancel_requested = true;
         if let Some(controller) = &self.controller {
             controller
                 .cancel_all
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = controller.answer_tx.send(JobAnswer::CancelBatch);
+            // One answer per worker: several may be queued behind the active
+            // prompt, and each needs an answer to leave its wait.
+            for _ in 0..controller.current_pids.len() {
+                let _ = controller.answer_tx.send(JobAnswer::CancelBatch);
+            }
         }
         self.password_prompt = None;
         self.password_input.clear();
         self.destination_prompt = None;
+        self.overwrite_prompt = None;
     }
 
-    fn current_child_pid(&self) -> u32 {
-        self.controller.as_ref().map_or(0, |controller| {
-            controller
-                .current_pid
-                .load(std::sync::atomic::Ordering::Relaxed)
-        })
+    fn current_child_pids(&self) -> Vec<u32> {
+        self.controller
+            .as_ref()
+            .map_or_else(Vec::new, |controller| {
+                controller
+                    .current_pids
+                    .iter()
+                    .map(|slot| slot.load(std::sync::atomic::Ordering::Relaxed))
+                    .filter(|pid| *pid != 0)
+                    .collect()
+            })
     }
 
-    /// Cancels the batch, terminates the running `ouch` process and closes the
-    /// window. Used when the user confirms closing mid-extraction.
+    /// Cancels the batch, terminates the running `ouch` processes and closes
+    /// the window. Used when the user confirms closing mid-extraction.
     fn abort_and_close(&mut self) {
         self.signal_cancel();
-        let pid = self.current_child_pid();
-        if pid != 0 {
+        for pid in self.current_child_pids() {
             crate::system::terminate_process(pid);
         }
 
@@ -1229,13 +1269,7 @@ impl App {
                 );
             });
         } else {
-            let (fraction, total, _) = self.progress;
-            let elapsed = self
-                .batch_started
-                .map(|started| started.elapsed().as_secs());
             let mut cancel_clicked = false;
-            // Volume currently being read, shown next to the running entry.
-            let running_part = self.progress.2;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -1243,23 +1277,24 @@ impl App {
                     let mut open: Option<PathBuf> = None;
                     for (index, file) in self.files.iter().enumerate() {
                         if file.status == Status::Running {
-                            let bar = if total > 0 {
-                                let text = if self.joining {
+                            let progress = file.progress;
+                            let bar = if progress.total > 0 {
+                                let text = if progress.joining {
                                     self.i18n.t("extract.joining_bar")
                                 } else {
-                                    format!("{:.0}%", fraction * 100.0)
+                                    format!("{:.0}%", progress.fraction * 100.0)
                                 };
-                                egui::ProgressBar::new(fraction).text(text)
+                                egui::ProgressBar::new(progress.fraction).text(text)
                             } else {
                                 egui::ProgressBar::new(0.0).animate(true)
                             };
-                            let bar = if self.joining {
+                            let bar = if progress.joining {
                                 bar.fill(JOINING_COLOR)
                             } else {
                                 bar
                             };
-                            let speed = (!self.joining && self.write_speed > 0)
-                                .then(|| format_speed(self.write_speed));
+                            let speed = (!progress.joining && progress.speed_bps > 0)
+                                .then(|| format_speed(progress.speed_bps));
                             ui.horizontal(|ui| {
                                 let spacing = ui.spacing().item_spacing.x;
                                 let reserve = speed.as_ref().map_or(0.0, |text| {
@@ -1291,7 +1326,7 @@ impl App {
                             // While a multi-volume set is running, show the part
                             // being read now, next to "Running".
                             let current = if file.status == Status::Running && multipart {
-                                let part_index = running_part.min(file.parts.len() - 1);
+                                let part_index = file.progress.part_index.min(file.parts.len() - 1);
                                 Some((part_index, &file.parts[part_index]))
                             } else {
                                 None
@@ -1328,7 +1363,7 @@ impl App {
                                         .join("\n"),
                                 );
                             }
-                            if file.status == Status::Running && self.joining {
+                            if file.status == Status::Running && file.progress.joining {
                                 ui.label(
                                     egui::RichText::new(self.i18n.t("extract.joining"))
                                         .small()
@@ -1349,7 +1384,8 @@ impl App {
                                         if ui.button(self.i18n.t("common.cancel")).clicked() {
                                             cancel_clicked = true;
                                         }
-                                        if let Some(secs) = elapsed {
+                                        if let Some(started) = file.started_at {
+                                            let secs = started.elapsed().as_secs();
                                             ui.label(
                                                 egui::RichText::new(
                                                     self.i18n
@@ -1359,12 +1395,12 @@ impl App {
                                                 .color(egui::Color32::GRAY),
                                             );
                                         }
-                                        if self.eta_secs > 0 {
+                                        if file.progress.eta_secs > 0 {
                                             ui.label(
                                                 egui::RichText::new(
                                                     self.i18n.t("progress.eta").replace(
                                                         "{time}",
-                                                        &format_duration(self.eta_secs),
+                                                        &format_duration(file.progress.eta_secs),
                                                     ),
                                                 )
                                                 .color(egui::Color32::GRAY),
@@ -1802,6 +1838,27 @@ impl App {
                 );
             }
         }
+
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(self.i18n.t("settings.parallel")).strong());
+        let mut parallel = self
+            .config
+            .parallel_extractions
+            .clamp(1, MAX_PARALLEL_EXTRACTIONS);
+        if spinbox_u32(
+            ui,
+            &mut parallel,
+            1..=MAX_PARALLEL_EXTRACTIONS,
+            SPINBOX_WIDTH,
+        ) {
+            self.config.parallel_extractions = parallel;
+            self.persist();
+        }
+        ui.label(
+            egui::RichText::new(self.i18n.t("settings.parallel.hint"))
+                .small()
+                .color(egui::Color32::GRAY),
+        );
 
         ui.add_space(12.0);
         ui.label(egui::RichText::new(self.i18n.t("settings.conflict")).strong());
@@ -2543,9 +2600,12 @@ impl App {
         });
 
         if let Some(answer) = answer {
-            self.overwrite_prompt = None;
-            if let Some(controller) = &self.controller {
-                let _ = controller.answer_tx.send(answer);
+            match answer {
+                JobAnswer::CancelBatch => self.cancel_batch(),
+                answer => {
+                    self.overwrite_prompt = None;
+                    self.send_answer(answer);
+                }
             }
         }
     }
@@ -2628,6 +2688,94 @@ mod ui_scale {
     /// Stored percentage for a slider value.
     pub fn from_percent_value(value: f32) -> u32 {
         value.round() as u32
+    }
+}
+
+/// Number field with stacked up/down arrows, since egui has no spinbox.
+///
+/// Returns true when the value changed, either by dragging, typing or clicking
+/// an arrow.
+fn spinbox_u32(ui: &mut egui::Ui, value: &mut u32, range: RangeInclusive<u32>, width: f32) -> bool {
+    let mut changed = false;
+    let (min, max) = (*range.start(), *range.end());
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(width + 16.0, 28.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_width(width + 16.0);
+            ui.spacing_mut().item_spacing.x = 0.0;
+
+            changed |= ui
+                .add_sized(
+                    egui::vec2(width, 28.0),
+                    egui::DragValue::new(value).range(range).speed(1.0),
+                )
+                .changed();
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(16.0, 28.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    if spin_arrow(ui, SpinDirection::Up) {
+                        *value = (*value + 1).min(max);
+                        changed = true;
+                    }
+                    if spin_arrow(ui, SpinDirection::Down) {
+                        *value = (*value).saturating_sub(1).max(min);
+                        changed = true;
+                    }
+                },
+            );
+        },
+    );
+
+    changed
+}
+
+/// Paints one clickable arrow for [`spinbox_u32`].
+fn spin_arrow(ui: &mut egui::Ui, direction: SpinDirection) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::click());
+
+    if response.hovered() || response.is_pointer_button_down_on() {
+        let visuals = ui.style().interact(&response);
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(3), visuals.weak_bg_fill);
+    }
+
+    let color = ui.style().interact(&response).fg_stroke.color;
+    let center = rect.center();
+    let points = match direction {
+        SpinDirection::Up => vec![
+            egui::pos2(center.x, center.y - 3.0),
+            egui::pos2(center.x - 4.0, center.y + 2.0),
+            egui::pos2(center.x + 4.0, center.y + 2.0),
+        ],
+        SpinDirection::Down => vec![
+            egui::pos2(center.x, center.y + 3.0),
+            egui::pos2(center.x - 4.0, center.y - 2.0),
+            egui::pos2(center.x + 4.0, center.y - 2.0),
+        ],
+    };
+
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        color,
+        egui::Stroke::NONE,
+    ));
+
+    response.clicked()
+}
+
+/// Marks archives that never started when the batch was cancelled.
+fn mark_cancelled_pending(files: &mut [FileEntry]) {
+    for file in files {
+        if file.status == Status::Pending {
+            file.status = Status::Skipped;
+            file.message = "cancelled".into();
+        }
     }
 }
 
@@ -2717,6 +2865,34 @@ mod tests {
         });
         output.textures_delta.clear();
         assert_eq!(seen, 1, "dropped file should be visible in input.raw");
+    }
+
+    #[test]
+    fn cancelled_batch_marks_pending_files_as_skipped() {
+        let mut files = vec![
+            FileEntry {
+                path: PathBuf::from("pending.zip"),
+                parts: Vec::new(),
+                status: Status::Pending,
+                message: String::new(),
+                progress: FileProgress::default(),
+                started_at: None,
+            },
+            FileEntry {
+                path: PathBuf::from("done.zip"),
+                parts: Vec::new(),
+                status: Status::Done,
+                message: String::new(),
+                progress: FileProgress::default(),
+                started_at: None,
+            },
+        ];
+
+        mark_cancelled_pending(&mut files);
+
+        assert_eq!(files[0].status, Status::Skipped);
+        assert_eq!(files[0].message, "cancelled");
+        assert_eq!(files[1].status, Status::Done, "finished files stay done");
     }
 
     #[test]
