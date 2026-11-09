@@ -2598,14 +2598,18 @@ impl App {
     reason = "the scale is clamped to 75..=200, so every conversion is exact"
 )]
 mod ui_scale {
+    /// Zoom applied at 100 %. It used to be `1.0`, but the default text was too
+    /// small, so 100 % now renders like the old 120 %.
+    const BASE_ZOOM: f32 = 1.2;
+
     /// Slider value (`75.0..=200.0`) for a stored percentage.
     pub fn percent_value(percent: u32) -> f32 {
         percent as f32
     }
 
-    /// egui zoom factor (`1.0` = 100 %) for a stored percentage.
+    /// egui zoom factor (`1.2` = 100 %) for a stored percentage.
     pub fn zoom_factor(percent: u32) -> f32 {
-        percent as f32 / 100.0
+        percent as f32 / 100.0 * BASE_ZOOM
     }
 
     /// Stored percentage for a slider value.
@@ -2904,5 +2908,13 @@ mod tests {
     fn fitting_never_shrinks_the_window() {
         let larger = default_window_size() + egui::vec2(200.0, 100.0);
         assert_eq!(fitted_size(larger, default_window_size()), larger);
+    }
+
+    #[test]
+    fn scale_100_matches_the_old_120() {
+        assert!(
+            (ui_scale::zoom_factor(100) - 1.2).abs() < 1.0e-6,
+            "100% must use the zoom that 120% used before"
+        );
     }
 }
