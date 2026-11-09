@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Changing the interface size no longer leaves the window smaller than the
+  layout needs. The window is fitted in points at startup and after a zoom
+  change, so the per-file **Cancel** button stays visible at every scale.
+  Long file names are truncated to keep the row controls reachable, and the
+  restart hint is gone because it is no longer necessary.
+
 ## [0.4.0] - 2026-11-07
 
 ### Added

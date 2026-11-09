@@ -25,12 +25,11 @@ const JOINING_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 /// Failures and failed entries, so they stand out from the rest of the text.
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x30, 0x25);
 
-/// How long the interface-size slider must stay still before the restart hint
-/// is shown, so dragging it does not open the modal on every step.
-const SCALE_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
-
 /// Width of the number field in the parallel-extractions spinbox, in points.
 const SPINBOX_WIDTH: f32 = 72.0;
+
+/// Tolerance for checking that egui activated the requested zoom.
+const ZOOM_EPSILON: f32 = 0.001;
 
 /// Direction of a [`spinbox_u32`] arrow.
 #[derive(Debug, Clone, Copy)]
@@ -238,14 +237,17 @@ pub struct App {
     view: Option<View>,
     /// Which tab is selected in the settings view.
     settings_tab: SettingsTab,
-    /// Inner size to restore when the overlay closes, in physical pixels. The
-    /// UI scale can be changed from the settings overlay, so points are not
-    /// stable. Refreshed every frame while no overlay is open.
+    /// Inner size to restore when the overlay closes, in points. Points keep
+    /// the layout stable when the UI scale changes from the settings overlay.
+    /// Refreshed every frame while no overlay is open.
     saved_window_size: Option<egui::Vec2>,
-    /// Resize in progress for the active overlay.
+    /// Resize in progress for the active view or the window minimum.
     fit: Option<FitRequest>,
-    /// Set when the window has to be fitted to the active overlay.
+    /// Set when the window has to be fitted to the active view or the minimum.
     fit_needed: bool,
+    /// Set when the zoom changed; the window is re-fitted on the next frame,
+    /// once egui has activated the new zoom.
+    fit_after_zoom: bool,
     /// Last applied UI scale (percent), to avoid re-setting it every frame.
     applied_scale: u32,
     /// Background update-check result, when ready.
@@ -264,11 +266,6 @@ pub struct App {
     /// True while the interface-size slider is dragged, to avoid re-applying
     /// the (expensive) zoom on every frame.
     scale_dragging: bool,
-    /// When the restart hint becomes due. Reset on every slider change while
-    /// dragging, so it waits for the last change.
-    scale_restart_deadline: Option<std::time::Instant>,
-    /// True while the restart hint is on screen.
-    scale_restart_prompt: bool,
     files: Vec<FileEntry>,
     log: Vec<String>,
     status_line: StatusLine,
@@ -392,7 +389,8 @@ impl App {
             settings_tab: SettingsTab::General,
             saved_window_size: None,
             fit: None,
-            fit_needed: startup == Startup::Settings,
+            fit_needed: true,
+            fit_after_zoom: false,
             applied_scale: initial_scale,
             update_status: None,
             update_rx: None,
@@ -401,8 +399,6 @@ impl App {
             config_dirty: false,
             last_config_save: None,
             scale_dragging: false,
-            scale_restart_deadline: None,
-            scale_restart_prompt: false,
             files: Vec::new(),
             log: Vec::new(),
             status_line: StatusLine::default(),
@@ -657,29 +653,6 @@ impl App {
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-    }
-
-    /// Shows the restart hint once the interface-size slider has been still for
-    /// [`SCALE_RESTART_DELAY`]. While it is being dragged the deadline keeps
-    /// moving, so the modal never interrupts a drag.
-    fn pump_scale_restart(&mut self, ctx: &egui::Context) {
-        if self.scale_restart_prompt {
-            return;
-        }
-        let Some(mut deadline) = self.scale_restart_deadline else {
-            return;
-        };
-        let now = std::time::Instant::now();
-        if self.scale_dragging {
-            deadline = now + SCALE_RESTART_DELAY;
-            self.scale_restart_deadline = Some(deadline);
-        }
-        if now >= deadline {
-            self.scale_restart_deadline = None;
-            self.scale_restart_prompt = true;
-            return;
-        }
-        ctx.request_repaint_after(deadline - now);
     }
 
     fn handle_event(&mut self, event: JobEvent) {
@@ -1074,22 +1047,6 @@ impl App {
 
         self.close_requested = true;
     }
-
-    /// Starts a fresh instance so the stored interface size lays out the window
-    /// correctly, then closes this one. The current window stays open when the
-    /// new process cannot be spawned.
-    fn restart_app(&mut self) {
-        self.flush_config(Flush::Forced);
-        match crate::system::restart() {
-            Ok(()) => self.close_requested = true,
-            Err(err) => {
-                let message = format!("{}: {err}", self.i18n.t("scale_restart.failed"));
-                self.status_line = StatusLine::error(message.clone());
-                self.push_log(message.clone());
-                self.error_popup = Some(message);
-            }
-        }
-    }
 }
 
 impl eframe::App for App {
@@ -1108,15 +1065,24 @@ impl eframe::App for App {
         if !self.scale_dragging && self.applied_scale != self.config.ui_scale {
             ctx.set_zoom_factor(ui_scale::zoom_factor(self.config.ui_scale));
             self.applied_scale = self.config.ui_scale;
+            self.fit_after_zoom = true;
+            ctx.request_repaint();
         }
-        self.pump_scale_restart(&ctx);
+        // The new zoom becomes active at the start of the next pass, so the fit
+        // must wait for it; otherwise egui still reports the old point size.
+        if self.fit_after_zoom
+            && (ctx.zoom_factor() - ui_scale::zoom_factor(self.applied_scale)).abs() < ZOOM_EPSILON
+        {
+            self.fit_after_zoom = false;
+            self.fit_needed = true;
+        }
 
         // Remember the size to go back to. `ViewportInfo::inner_rect` cannot be
         // used: Wayland does not expose the window position, so it is `None`
         // there. The viewport rect always has the size, in points.
         let needs_saved = self.view.is_none() || self.saved_window_size.is_none();
         if let Some(size) = window_size(&ctx).filter(|_| needs_saved) {
-            self.saved_window_size = Some(size * ctx.pixels_per_point());
+            self.saved_window_size = Some(size.max(default_window_size()));
         }
 
         if std::mem::take(&mut self.fit_needed) {
@@ -1185,7 +1151,6 @@ impl eframe::App for App {
         if self.view == Some(View::Settings) {
             self.ui_bulk_password_modal(&ctx);
         }
-        self.ui_scale_restart(&ctx);
 
         // Persist any pending settings change (debounced).
         self.flush_config(Flush::Debounced);
@@ -1316,69 +1281,76 @@ impl App {
                                 }
                             });
                         }
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(self.i18n.t(file.status.label_key()))
-                                    .color(file.status.color())
-                                    .small(),
-                            );
-                            let multipart = file.parts.len() > 1;
-                            // While a multi-volume set is running, show the part
-                            // being read now, next to "Running".
-                            let current = if file.status == Status::Running && multipart {
-                                let part_index = file.progress.part_index.min(file.parts.len() - 1);
-                                Some((part_index, &file.parts[part_index]))
-                            } else {
-                                None
-                            };
-                            let shown = current.map_or(&file.path, |(_, part)| part);
-                            let name = shown.file_name().map_or_else(
-                                || shown.display().to_string(),
-                                |name| name.to_string_lossy().into_owned(),
-                            );
-                            ui.label(name).on_hover_text(shown.display().to_string());
-                            if let Some((part_index, _)) = current {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}/{}",
-                                        part_index + 1,
-                                        file.parts.len()
-                                    ))
-                                    .small()
-                                    .color(egui::Color32::GRAY),
-                                );
-                            } else if multipart {
-                                let hint = self
-                                    .i18n
-                                    .t("extract.parts")
-                                    .replace("{count}", &file.parts.len().to_string());
-                                ui.label(
-                                    egui::RichText::new(hint).small().color(egui::Color32::GRAY),
-                                )
-                                .on_hover_text(
-                                    file.parts
-                                        .iter()
-                                        .map(|part| part.display().to_string())
-                                        .collect::<Vec<_>>()
-                                        .join("\n"),
-                                );
-                            }
-                            if file.status == Status::Running && file.progress.joining {
-                                ui.label(
-                                    egui::RichText::new(self.i18n.t("extract.joining"))
-                                        .small()
-                                        .color(JOINING_COLOR),
-                                );
-                            }
-                            if file.status == Status::Failed && !file.message.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(&file.message)
-                                        .small()
-                                        .color(ERROR_COLOR),
-                                );
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
+                        egui::containers::Sides::new()
+                            .shrink_left()
+                            .truncate()
+                            .show(
+                                ui,
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(self.i18n.t(file.status.label_key()))
+                                            .color(file.status.color())
+                                            .small(),
+                                    );
+                                    let multipart = file.parts.len() > 1;
+                                    // While a multi-volume set is running, show the part
+                                    // being read now, next to "Running".
+                                    let current = if file.status == Status::Running && multipart {
+                                        let part_index =
+                                            file.progress.part_index.min(file.parts.len() - 1);
+                                        Some((part_index, &file.parts[part_index]))
+                                    } else {
+                                        None
+                                    };
+                                    let shown = current.map_or(&file.path, |(_, part)| part);
+                                    let name = shown.file_name().map_or_else(
+                                        || shown.display().to_string(),
+                                        |name| name.to_string_lossy().into_owned(),
+                                    );
+                                    ui.label(name).on_hover_text(shown.display().to_string());
+                                    if let Some((part_index, _)) = current {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}/{}",
+                                                part_index + 1,
+                                                file.parts.len()
+                                            ))
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                        );
+                                    } else if multipart {
+                                        let hint = self
+                                            .i18n
+                                            .t("extract.parts")
+                                            .replace("{count}", &file.parts.len().to_string());
+                                        ui.label(
+                                            egui::RichText::new(hint)
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        )
+                                        .on_hover_text(
+                                            file.parts
+                                                .iter()
+                                                .map(|part| part.display().to_string())
+                                                .collect::<Vec<_>>()
+                                                .join("\n"),
+                                        );
+                                    }
+                                    if file.status == Status::Running && file.progress.joining {
+                                        ui.label(
+                                            egui::RichText::new(self.i18n.t("extract.joining"))
+                                                .small()
+                                                .color(JOINING_COLOR),
+                                        );
+                                    }
+                                    if file.status == Status::Failed && !file.message.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&file.message)
+                                                .small()
+                                                .color(ERROR_COLOR),
+                                        );
+                                    }
+                                },
                                 |ui| {
                                     if file.status == Status::Running {
                                         if ui.button(self.i18n.t("common.cancel")).clicked() {
@@ -1428,7 +1400,6 @@ impl App {
                                     }
                                 },
                             );
-                        });
                     }
                     if let Some(path) = open {
                         crate::system::open_folder(&path);
@@ -1452,7 +1423,6 @@ impl App {
             || self.confirm_close
             || self.error_popup.is_some()
             || self.bulk_password_open
-            || self.scale_restart_prompt
     }
 
     /// Shows an overlay on top of the main window, growing the window if the
@@ -1477,44 +1447,50 @@ impl App {
         self.flush_config(Flush::Forced);
         self.fit = None;
         self.fit_needed = false;
+        self.scale_dragging = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(crate::WINDOW_TITLE.to_owned()));
 
         let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
         if !maximized {
-            let size = self.saved_window_size.take().map_or_else(
-                || egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1]),
-                |pixels| pixels / ctx.pixels_per_point(),
-            );
+            let minimum = default_window_size();
+            let size = self
+                .saved_window_size
+                .take()
+                .unwrap_or(minimum)
+                .max(minimum);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
         ctx.request_repaint();
     }
 
-    /// Appends the active view to the window title and starts growing the
-    /// window so it fits.
+    /// Appends the active view to the window title and starts growing the window
+    /// so it fits, or so it reaches the main window minimum when no view is open.
     fn start_window_fit(&mut self, ctx: &egui::Context) {
-        let Some(view) = self.view else {
-            return;
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "{} — {}",
-            crate::WINDOW_TITLE,
-            self.i18n.t(view.title_key())
-        )));
+        if let Some(view) = self.view {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                "{} — {}",
+                crate::WINDOW_TITLE,
+                self.i18n.t(view.title_key())
+            )));
+        }
+
+        // The minimum is in points, so it follows the UI scale. Sending it again
+        // after a zoom change keeps the window from becoming smaller than the
+        // layout in points.
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(default_window_size()));
 
         // eframe creates the window before the UI scale is applied, so until it
         // reports the real size the window has the default size in native
         // pixels, which is the default divided by the zoom in points.
-        let current = window_size(ctx).unwrap_or_else(|| {
-            egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
-                / ctx.zoom_factor()
-        });
+        let current = window_size(ctx).unwrap_or_else(|| default_window_size() / ctx.zoom_factor());
         if self.saved_window_size.is_none() {
-            self.saved_window_size = Some(current * ctx.pixels_per_point());
+            self.saved_window_size = Some(current.max(default_window_size()));
         }
 
-        let wanted = view.window_size();
-        let target = egui::vec2(current.x.max(wanted.x), current.y.max(wanted.y));
+        let wanted = self
+            .view
+            .map_or_else(default_window_size, View::window_size);
+        let target = fitted_size(current, wanted);
         if target.x <= current.x + 0.5 && target.y <= current.y + 0.5 {
             return;
         }
@@ -1981,7 +1957,6 @@ impl App {
         self.scale_dragging = response.dragged();
         if response.changed() {
             self.config.ui_scale = ui_scale::from_percent_value(scale);
-            self.scale_restart_deadline = Some(std::time::Instant::now() + SCALE_RESTART_DELAY);
             self.persist();
         }
 
@@ -2011,13 +1986,9 @@ impl App {
         ui.separator();
         if ui.button(self.i18n.t("settings.reset")).clicked() {
             // Keep saved passwords; reset everything else.
-            let previous_scale = self.config.ui_scale;
             let passwords = std::mem::take(&mut self.config.passwords);
             self.config = Config::default();
             self.config.passwords = passwords;
-            if self.config.ui_scale != previous_scale {
-                self.scale_restart_deadline = Some(std::time::Instant::now() + SCALE_RESTART_DELAY);
-            }
             self.destination_dir_input.clear();
             self.i18n = I18n::new(self.config.language);
             theme::apply(ui.ctx(), self.config.theme);
@@ -2413,54 +2384,6 @@ impl App {
         }
     }
 
-    /// Offers to restart after the interface-size slider changes: the zoom is
-    /// applied live, but a fresh start is what lays the window out correctly.
-    fn ui_scale_restart(&mut self, ctx: &egui::Context) {
-        if !self.scale_restart_prompt {
-            return;
-        }
-
-        let mut restart = false;
-        let mut dismiss = false;
-        egui::Modal::new(egui::Id::unique("scale-restart-modal")).show(ctx, |ui| {
-            let max_width = (ctx.viewport_rect().width() - 48.0).clamp(280.0, 680.0);
-            ui.set_min_width(max_width.min(380.0));
-            ui.set_max_width(max_width);
-            ui.heading(self.i18n.t("scale_restart.title"));
-            ui.label(self.i18n.t("scale_restart.body"));
-            if self.running {
-                ui.label(
-                    egui::RichText::new(self.i18n.t("scale_restart.running"))
-                        .small()
-                        .color(egui::Color32::GRAY),
-                );
-            }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let button = ui
-                    .add_enabled(
-                        !self.running,
-                        egui::Button::new(self.i18n.t("scale_restart.restart")),
-                    )
-                    .on_disabled_hover_text(self.i18n.t("scale_restart.running"));
-                if button.clicked() {
-                    restart = true;
-                }
-                if ui.button(self.i18n.t("common.close")).clicked() {
-                    dismiss = true;
-                }
-            });
-        });
-
-        if restart {
-            self.scale_restart_prompt = false;
-            self.restart_app();
-            ctx.request_repaint();
-        } else if dismiss {
-            self.scale_restart_prompt = false;
-        }
-    }
-
     fn ui_destination_modal(&mut self, ctx: &egui::Context) {
         let Some(prompt) = self.destination_prompt.as_ref() else {
             return;
@@ -2808,6 +2731,16 @@ fn format_speed(bytes_per_sec: u64) -> String {
 /// Application logo, embedded in the binary for the About view.
 const LOGO_PNG: &[u8] = include_bytes!("../assets/ouch-decompress-gui-256.png");
 
+/// Default and minimum inner size of the main window, in points.
+fn default_window_size() -> egui::Vec2 {
+    egui::vec2(crate::DEFAULT_WINDOW_SIZE[0], crate::DEFAULT_WINDOW_SIZE[1])
+}
+
+/// Largest of `current` and `wanted`, so a fit never shrinks the window.
+fn fitted_size(current: egui::Vec2, wanted: egui::Vec2) -> egui::Vec2 {
+    current.max(wanted)
+}
+
 /// Current inner size of the window in points, or `None` while egui still uses
 /// its placeholder rect: eframe reports the real size after the first frame, and
 /// until then egui falls back to a 10000-point rect (rescaled by the zoom).
@@ -2929,5 +2862,47 @@ mod tests {
         assert_eq!(format_speed(1536), "1.5 KB/s");
         assert_eq!(format_speed(12 * 1024 * 1024 + 300 * 1024), "12.3 MB/s");
         assert_eq!(format_speed(3 * 1024 * 1024 * 1024), "3.00 GB/s");
+    }
+
+    #[test]
+    fn zoom_shrinks_the_window_until_it_is_fitted_in_points() {
+        let ctx = egui::Context::default();
+        let default = default_window_size();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, default)),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |_ui| {});
+        output.textures_delta.clear();
+
+        // egui scales the previous viewport rect when a new zoom activates, so
+        // the shrink is visible on the following pass, as in the real startup.
+        ctx.set_zoom_factor(1.4);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, default)),
+            ..Default::default()
+        };
+        let mut measured = None;
+        let mut output = ctx.run_ui(raw, |ui| {
+            measured = window_size(ui.ctx());
+        });
+        output.textures_delta.clear();
+
+        let measured = measured.expect("the first pass provides a screen rect");
+        assert!(
+            measured.x < default.x - 1.0,
+            "at 140% the window must be smaller in points: {measured:?}"
+        );
+        assert_eq!(
+            fitted_size(measured, default),
+            default,
+            "the fit must restore the minimum size in points"
+        );
+    }
+
+    #[test]
+    fn fitting_never_shrinks_the_window() {
+        let larger = default_window_size() + egui::vec2(200.0, 100.0);
+        assert_eq!(fitted_size(larger, default_window_size()), larger);
     }
 }

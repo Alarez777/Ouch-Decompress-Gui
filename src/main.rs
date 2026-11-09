@@ -24,8 +24,8 @@ use std::path::PathBuf;
 /// overlay appended to it, to keep the old "separate window" cue.
 pub const WINDOW_TITLE: &str = "Ouch Decompress";
 
-/// Default inner size of the main window, in points. It is also restored when
-/// an overlay closes if the size before opening it is unknown.
+/// Default and minimum inner size of the main window, in points. It is also
+/// restored when an overlay closes if the size before opening it is unknown.
 pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [580.0, 300.0];
 
 #[expect(
