@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-09
+
+### Changed
+
+- The top-row buttons (**Add file**, **Settings**, **Log**, **About**) are 25%
+  larger with 19.5 pt labels, so they are easier to click and read.
+
 ## [0.4.1] - 2026-11-08
 
 ### Changed
