@@ -31,6 +31,13 @@ const SPINBOX_WIDTH: f32 = 72.0;
 /// Tolerance for checking that egui activated the requested zoom.
 const ZOOM_EPSILON: f32 = 0.001;
 
+/// Extra size for the boxes of the buttons in the top row.
+const HEADER_BUTTON_SCALE: f32 = 1.25;
+
+/// Text size for the top-row buttons, in points. It is larger than the scaled
+/// box so the labels do not look small inside the bigger buttons.
+const HEADER_BUTTON_FONT_SIZE: f32 = 19.5;
+
 /// Direction of a [`spinbox_u32`] arrow.
 #[derive(Debug, Clone, Copy)]
 enum SpinDirection {
@@ -1124,20 +1131,21 @@ impl eframe::App for App {
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                enlarge_header_buttons(ui);
                 let picking = self.file_picker_rx.is_some();
                 if ui
-                    .add_enabled(!picking, egui::Button::new(self.i18n.t("extract.add_file")))
+                    .add_enabled(!picking, header_button(self.i18n.t("extract.add_file")))
                     .clicked()
                 {
                     self.start_file_picker(ui.ctx());
                 }
-                if ui.button(self.i18n.t("tab.settings")).clicked() {
+                if ui.add(header_button(self.i18n.t("tab.settings"))).clicked() {
                     self.open_view(View::Settings, ui.ctx());
                 }
-                if ui.button(self.i18n.t("tab.log")).clicked() {
+                if ui.add(header_button(self.i18n.t("tab.log"))).clicked() {
                     self.open_view(View::Log, ui.ctx());
                 }
-                if ui.button(self.i18n.t("tab.about")).clicked() {
+                if ui.add(header_button(self.i18n.t("tab.about"))).clicked() {
                     self.open_view(View::About, ui.ctx());
                     self.maybe_check_update(ui.ctx());
                 }
@@ -2618,6 +2626,19 @@ mod ui_scale {
     }
 }
 
+/// Enlarges only the boxes of the buttons in the top row.
+fn enlarge_header_buttons(ui: &mut egui::Ui) {
+    let style = ui.style_mut();
+    style.spacing.button_padding *= HEADER_BUTTON_SCALE;
+    style.spacing.interact_size *= HEADER_BUTTON_SCALE;
+}
+
+/// Top-row button with an explicit text size, which egui's button fallback font
+/// does not apply to plain text labels.
+fn header_button(text: String) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text).size(HEADER_BUTTON_FONT_SIZE))
+}
+
 /// Number field with stacked up/down arrows, since egui has no spinbox.
 ///
 /// Returns true when the value changed, either by dragging, typing or clicking
@@ -2915,6 +2936,42 @@ mod tests {
         assert!(
             (ui_scale::zoom_factor(100) - 1.2).abs() < 1.0e-6,
             "100% must use the zoom that 120% used before"
+        );
+    }
+
+    #[test]
+    fn header_buttons_and_their_text_are_enlarged() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut measured = None;
+        let mut output = ctx.run_ui(raw, |ui| {
+            let normal = ui.add(egui::Button::new("Log")).rect;
+            enlarge_header_buttons(ui);
+            let enlarged = ui.add(header_button("Log".to_owned())).rect;
+            measured = Some((normal, enlarged));
+        });
+        output.textures_delta.clear();
+
+        let (normal, enlarged) = measured.expect("the pass provides a root ui");
+        assert!(
+            enlarged.height() >= normal.height() * HEADER_BUTTON_SCALE,
+            "button height must grow by at least HEADER_BUTTON_SCALE: \
+             {} -> {}",
+            normal.height(),
+            enlarged.height()
+        );
+        assert!(
+            enlarged.width() >= normal.width() * HEADER_BUTTON_SCALE,
+            "the bigger text must make the button wider: {} -> {}",
+            normal.width(),
+            enlarged.width()
         );
     }
 }
