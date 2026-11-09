@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+### Changed
+
+- The interface size is recalibrated: 100% now renders like the previous 120%,
+  because the default text was too small. Existing percentages keep their
+  value, so they look 20% larger; lower the slider if needed.
+
+### Fixed
+
+- Changing the interface size no longer leaves the window smaller than the
+  layout needs. The window is fitted in points at startup and after a zoom
+  change, so the per-file **Cancel** button stays visible at every scale.
+  Long file names are truncated to keep the row controls reachable, and the
+  restart hint is gone because it is no longer necessary.
+
 ## [0.4.0] - 2026-11-07
 
 ### Added
