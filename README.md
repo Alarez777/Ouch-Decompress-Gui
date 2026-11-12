@@ -168,7 +168,9 @@ Releases are built automatically by GitHub Actions
 (`.github/workflows/release.yml`) **only when a tag like `v0.1.0` is pushed**.
 Each release contains a self-contained AppImage for `x86_64` and `aarch64`; the
 bundled `ouch` binary lives under `usr/bin/ouch` and is resolved at runtime
-through `$APPDIR`.
+through `$APPDIR`. The AppImage runtime is
+[uruntime](https://github.com/VHSgunzo/uruntime)
+(`appimage-squashfs-lite`), not the AppImage type 2 runtime.
 
 To cut a release:
 
