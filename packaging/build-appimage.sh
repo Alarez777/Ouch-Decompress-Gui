@@ -13,10 +13,7 @@
 # Environment:
 #   OUCH_VERSION   overrides the pinned ouch version (default: 0.8.3)
 #   URUNTIME_VERSION  overrides the pinned uruntime version (default: v0.8.1)
-#   URUNTIME_VARIANT  overrides the uruntime variant
-#                     (default: appimage-squashfs-lite)
-#   URUNTIME_SHA256   expected SHA-256 for a custom runtime; required when the
-#                     version or variant is not the pinned default
+#   URUNTIME_SHA256   expected SHA-256 for a custom runtime version
 #   SKIP_LINUXDEPLOY=1  skip bundling shared libraries (smaller, less portable)
 #
 set -euo pipefail
@@ -27,7 +24,9 @@ cd "$ROOT"
 ARCH="${1:-$(uname -m)}"
 OUCH_VERSION="${OUCH_VERSION:-0.8.3}"
 URUNTIME_VERSION="${URUNTIME_VERSION:-v0.8.1}"
-URUNTIME_VARIANT="${URUNTIME_VARIANT:-appimage-squashfs-lite}"
+# appimagetool builds a SquashFS payload, so the runtime must be a SquashFS
+# variant. Keep it fixed to avoid a runtime/payload mismatch.
+URUNTIME_VARIANT="appimage-squashfs-lite"
 URUNTIME_SHA256="${URUNTIME_SHA256:-}"
 TOOLS_DIR="$ROOT/.cache/appimage-tools"
 DIST_DIR="$ROOT/dist"
@@ -85,15 +84,14 @@ OUCH_BIN="$(find "$OUCH_EXTRACT" -type f -name ouch | head -n1)"
 [ -n "$OUCH_BIN" ] || { echo "could not find ouch in tarball" >&2; exit 1; }
 
 echo "==> Fetching uruntime $URUNTIME_VERSION ($URUNTIME_VARIANT, $APPIMAGE_ARCH)"
-URUNTIME_BIN="$TOOLS_DIR/uruntime-$URUNTIME_VARIANT-$APPIMAGE_ARCH"
+URUNTIME_BIN="$TOOLS_DIR/uruntime-$URUNTIME_VERSION-$URUNTIME_VARIANT-$APPIMAGE_ARCH"
 download \
     "https://github.com/VHSgunzo/uruntime/releases/download/$URUNTIME_VERSION/uruntime-$URUNTIME_VARIANT-$APPIMAGE_ARCH" \
     "$URUNTIME_BIN"
 
 if [ -n "$URUNTIME_SHA256" ]; then
     EXPECTED_URUNTIME_SHA256="$URUNTIME_SHA256"
-elif [ "$URUNTIME_VERSION" = "v0.8.1" ] &&
-    [ "$URUNTIME_VARIANT" = "appimage-squashfs-lite" ]; then
+elif [ "$URUNTIME_VERSION" = "v0.8.1" ]; then
     case "$APPIMAGE_ARCH" in
         x86_64) EXPECTED_URUNTIME_SHA256="32c6024a14ff375749ee3bed3330c1586a6dd2bfeddbbd7ceacc053aec2b27a3" ;;
         aarch64) EXPECTED_URUNTIME_SHA256="5158dbe45224ecf51aa5ee46be22d4d63f30c6f13a7427bad4af0018016d836c" ;;
@@ -103,7 +101,7 @@ elif [ "$URUNTIME_VERSION" = "v0.8.1" ] &&
             ;;
     esac
 else
-    echo "set URUNTIME_SHA256 to verify uruntime $URUNTIME_VERSION ($URUNTIME_VARIANT)" >&2
+    echo "set URUNTIME_SHA256 to verify uruntime $URUNTIME_VERSION" >&2
     exit 1
 fi
 
