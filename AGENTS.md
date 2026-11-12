@@ -54,6 +54,11 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
   upstream, because it makes the interface unresponsive.
 - The bundled `ouch` is a static-PIE binary, so it must be copied into the
   AppDir *after* `linuxdeploy` runs (see `packaging/build-appimage.sh`).
+- AppImages use the pinned [uruntime](https://github.com/VHSgunzo/uruntime)
+  `appimage-squashfs-lite` runtime, passed to `appimagetool` with
+  `--runtime-file`. Keep its version and SHA-256 pinned, and verify that
+  `--appimage-updateinfo` still reports the `gh-releases-zsync` string when
+  bumping it.
 - Extraction progress is *estimated*: `ouch` exposes no progress, so each worker
   polls its child's `/proc/<pid>/io` `rchar` and divides it by the archive size
   (`src/job.rs`). Keep it best-effort and Linux-only.

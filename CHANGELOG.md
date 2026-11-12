@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- AppImages now use the [uruntime](https://github.com/VHSgunzo/uruntime)
+  SquashFS runtime (`appimage-squashfs-lite`) instead of the AppImage type 2
+  runtime. The payload stays SquashFS, and the `gh-releases-zsync` update
+  information and `.zsync` generation are unchanged.
+
 ## [0.4.2] - 2026-11-09
 
 ### Changed

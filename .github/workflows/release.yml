@@ -65,6 +65,25 @@ jobs:
           appimage="$(ls dist/*.AppImage)"
           APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
 
+          # The runtime swap must keep uruntime in place and preserve the
+          # `.upd_info` string that Gear Lever and AppImageUpdate read.
+          runtime_version="$("$appimage" --appimage-version)"
+          echo "runtime: $runtime_version"
+          case "$runtime_version" in
+            v*) ;;
+            *)
+              echo "::error::expected a uruntime AppImage, got: $runtime_version"
+              exit 1
+              ;;
+          esac
+
+          update_info="$("$appimage" --appimage-updateinfo)"
+          echo "update info: $update_info"
+          if ! printf '%s\n' "$update_info" | grep -q '^gh-releases-zsync|'; then
+            echo "::error::missing gh-releases-zsync update information"
+            exit 1
+          fi
+
           # Every bundled ELF must run on the oldest glibc we support, not just
           # the main binary: linuxdeploy copies libraries from the runner too.
           max_glibc="$(

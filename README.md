@@ -187,8 +187,14 @@ packaging/build-appimage.sh
 packaging/build-appimage.sh aarch64
 ```
 
-The script downloads `linuxdeploy` and `appimagetool` into `.cache/`, and the
-`ouch` release into the same cache, so subsequent runs are offline. Set
+The script downloads `linuxdeploy`, `appimagetool` and the
+[uruntime](https://github.com/VHSgunzo/uruntime) AppImage runtime into
+`.cache/`, and the `ouch` release into the same cache, so subsequent runs are
+offline. The runtime is pinned to uruntime `v0.8.1`
+(`appimage-squashfs-lite`) and verified by SHA-256; the payload is still
+SquashFS and the `gh-releases-zsync` update information is unchanged. Set
+`URUNTIME_VERSION`, `URUNTIME_VARIANT` and `URUNTIME_SHA256` to use another
+runtime build. Set
 `SKIP_LINUXDEPLOY=1` to produce a smaller AppImage that relies on system
 libraries instead of bundling them.
 
