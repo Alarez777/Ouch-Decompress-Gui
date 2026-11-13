@@ -168,7 +168,9 @@ Releases are built automatically by GitHub Actions
 (`.github/workflows/release.yml`) **only when a tag like `v0.1.0` is pushed**.
 Each release contains a self-contained AppImage for `x86_64` and `aarch64`; the
 bundled `ouch` binary lives under `usr/bin/ouch` and is resolved at runtime
-through `$APPDIR`.
+through `$APPDIR`. The AppImage runtime is
+[uruntime](https://github.com/VHSgunzo/uruntime)
+(`appimage-squashfs-lite`), not the AppImage type 2 runtime.
 
 To cut a release:
 
@@ -187,8 +189,15 @@ packaging/build-appimage.sh
 packaging/build-appimage.sh aarch64
 ```
 
-The script downloads `linuxdeploy` and `appimagetool` into `.cache/`, and the
-`ouch` release into the same cache, so subsequent runs are offline. Set
+The script downloads `linuxdeploy`, `appimagetool` and the
+[uruntime](https://github.com/VHSgunzo/uruntime) AppImage runtime into
+`.cache/`, and the `ouch` release into the same cache, so subsequent runs are
+offline. The runtime is pinned to uruntime `v0.8.1`
+(`appimage-squashfs-lite`) and verified by SHA-256; the payload is still
+SquashFS and the `gh-releases-zsync` update information is unchanged. The
+runtime variant is fixed to `appimage-squashfs-lite` so it always matches the
+SquashFS payload; set `URUNTIME_VERSION` and `URUNTIME_SHA256` to use another
+runtime build. Set
 `SKIP_LINUXDEPLOY=1` to produce a smaller AppImage that relies on system
 libraries instead of bundling them.
 
