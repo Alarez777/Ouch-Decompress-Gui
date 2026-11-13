@@ -24,6 +24,8 @@ cd "$ROOT"
 ARCH="${1:-$(uname -m)}"
 OUCH_VERSION="${OUCH_VERSION:-0.8.3}"
 URUNTIME_VERSION="${URUNTIME_VERSION:-v0.8.1}"
+# The release URL and the checksum pin use the `v` prefix; accept both forms.
+URUNTIME_VERSION="v${URUNTIME_VERSION#v}"
 # appimagetool builds a SquashFS payload, so the runtime must be a SquashFS
 # variant. Keep it fixed to avoid a runtime/payload mismatch.
 URUNTIME_VARIANT="appimage-squashfs-lite"
