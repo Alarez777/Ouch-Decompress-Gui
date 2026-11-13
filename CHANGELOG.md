@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SquashFS runtime (`appimage-squashfs-lite`) instead of the AppImage type 2
   runtime. The payload stays SquashFS, and the `gh-releases-zsync` update
   information and `.zsync` generation are unchanged.
+- `appimagetool` and `linuxdeploy` are pinned in `packaging/versions.env` and
+  verified by SHA-256, so release builds are reproducible.
 
 ## [0.4.2] - 2026-11-09
 
