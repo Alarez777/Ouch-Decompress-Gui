@@ -111,9 +111,14 @@ reason.
 - **Every change starts on its own branch.** Never commit directly to `develop`
   or `main`: branch off `develop` using a descriptive prefix (`feature/...`,
   `fix/...`, `docs/...`, `chore/...`) and merge it back into `develop`.
+- **Never merge a change branch into `develop` without explicit user
+  confirmation.** Prepare the branch, run the checks below, and ask first;
+  merging is a separate step the user must approve.
 - **Before merging any change branch into `develop`, run the `rust-review` skill
-  over `git diff develop...HEAD` and fix every `Must fix` finding.** Re-run
-  `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
+  over `git diff develop...HEAD` and fix every `Must fix` finding.** If the
+  diff contains no Rust code, state that in the merge request instead of
+  skipping the review silently. Re-run `cargo fmt`,
+  `cargo clippy --all-targets -- -D warnings` and
   `cargo test --release --locked` before the merge.
 - Merge `develop` into `main` only when preparing a release, then push a tag
   `vX.Y.Z`. `.github/workflows/release.yml` builds the AppImages and creates the
