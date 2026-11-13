@@ -62,25 +62,29 @@ jobs:
 
       - name: Check the AppImage
         run: |
-          appimage="$(ls dist/*.AppImage)"
+          appimage="dist/Ouch-Decompress-Gui-${{ matrix.arch }}.AppImage"
+          [ -x "$appimage" ] || { echo "::error::missing $appimage"; exit 1; }
           APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
 
-          # The runtime swap must keep uruntime in place and preserve the
-          # `.upd_info` string that Gear Lever and AppImageUpdate read.
+          # The runtime and update information must match the pins that the
+          # build script used.
+          # shellcheck source=packaging/versions.env
+          source packaging/versions.env
+
           runtime_version="$("$appimage" --appimage-version)"
           echo "runtime: $runtime_version"
-          case "$runtime_version" in
-            v*) ;;
-            *)
-              echo "::error::expected a uruntime AppImage, got: $runtime_version"
-              exit 1
-              ;;
-          esac
+          if [ "$runtime_version" != "$URUNTIME_VERSION" ]; then
+            echo "::error::expected uruntime $URUNTIME_VERSION, got: $runtime_version"
+            exit 1
+          fi
 
           update_info="$("$appimage" --appimage-updateinfo)"
           echo "update info: $update_info"
-          if ! printf '%s\n' "$update_info" | grep -q '^gh-releases-zsync|'; then
-            echo "::error::missing gh-releases-zsync update information"
+          gh_owner="${GITHUB_REPOSITORY%%/*}"
+          gh_name="${GITHUB_REPOSITORY##*/}"
+          expected_update_info="gh-releases-zsync|${gh_owner}|${gh_name}|latest|Ouch-Decompress-Gui-*${{ matrix.arch }}.AppImage.zsync"
+          if [ "$update_info" != "$expected_update_info" ]; then
+            echo "::error::expected update info '$expected_update_info', got '$update_info'"
             exit 1
           fi
 
