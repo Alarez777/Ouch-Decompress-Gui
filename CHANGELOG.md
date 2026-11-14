@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-14
+
 ### Changed
 
 - AppImages now use the [uruntime](https://github.com/VHSgunzo/uruntime)
