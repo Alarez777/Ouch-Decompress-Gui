@@ -11,16 +11,28 @@
 #   packaging/build-appimage.sh [x86_64|aarch64]
 #
 # Environment:
-#   OUCH_VERSION   overrides the pinned ouch version (default: 0.8.3)
+#   OUCH_VERSION   overrides the pinned ouch version (default: from versions.env)
+#   URUNTIME_VERSION  overrides the pinned uruntime version (default: from versions.env)
+#   URUNTIME_SHA256   expected SHA-256 for a custom runtime version
 #   SKIP_LINUXDEPLOY=1  skip bundling shared libraries (smaller, less portable)
+#
+# Pinned build inputs and their SHA-256 values live in packaging/versions.env.
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 cd "$ROOT"
 
+# shellcheck source=packaging/versions.env
+source "$ROOT/packaging/versions.env"
+
 ARCH="${1:-$(uname -m)}"
-OUCH_VERSION="${OUCH_VERSION:-0.8.3}"
+# The release URL and the checksum pin use the `v` prefix; accept both forms.
+URUNTIME_VERSION="v${URUNTIME_VERSION#v}"
+# appimagetool builds a SquashFS payload, so the runtime must be a SquashFS
+# variant. Keep it fixed to avoid a runtime/payload mismatch.
+URUNTIME_VARIANT="appimage-squashfs-lite"
+URUNTIME_SHA256="${URUNTIME_SHA256:-}"
 TOOLS_DIR="$ROOT/.cache/appimage-tools"
 DIST_DIR="$ROOT/dist"
 APPDIR="$DIST_DIR/Ouch-Decompress-Gui.AppDir"
@@ -30,11 +42,17 @@ case "$ARCH" in
         APPIMAGE_ARCH="x86_64"
         OUCH_TRIPLE="x86_64-unknown-linux-musl"
         RUST_TARGET="x86_64-unknown-linux-gnu"
+        URUNTIME_SHA256_PINNED="$URUNTIME_SHA256_X86_64"
+        APPIMAGETOOL_SHA256_PINNED="$APPIMAGETOOL_SHA256_X86_64"
+        LINUXDEPLOY_SHA256_PINNED="$LINUXDEPLOY_SHA256_X86_64"
         ;;
     aarch64|arm64)
         APPIMAGE_ARCH="aarch64"
         OUCH_TRIPLE="aarch64-unknown-linux-musl"
         RUST_TARGET="aarch64-unknown-linux-gnu"
+        URUNTIME_SHA256_PINNED="$URUNTIME_SHA256_AARCH64"
+        APPIMAGETOOL_SHA256_PINNED="$APPIMAGETOOL_SHA256_AARCH64"
+        LINUXDEPLOY_SHA256_PINNED="$LINUXDEPLOY_SHA256_AARCH64"
         ;;
     *)
         echo "unsupported architecture: $ARCH" >&2
@@ -53,6 +71,15 @@ download() {
     echo "downloading $(basename "$dest")"
     curl -fsSL "$url" -o "$dest"
     chmod +x "$dest"
+}
+
+verify_sha256() {
+    # verify_sha256 <file> <expected>
+    local file="$1" expected="$2"
+    if ! printf '%s  %s\n' "$expected" "$file" | sha256sum -c -; then
+        echo "SHA-256 mismatch for $file; remove it and retry" >&2
+        exit 1
+    fi
 }
 
 echo "==> Building the GUI (release)"
@@ -75,6 +102,23 @@ mkdir -p "$OUCH_EXTRACT"
 tar -xzf "$OUCH_TARBALL" -C "$OUCH_EXTRACT"
 OUCH_BIN="$(find "$OUCH_EXTRACT" -type f -name ouch | head -n1)"
 [ -n "$OUCH_BIN" ] || { echo "could not find ouch in tarball" >&2; exit 1; }
+
+echo "==> Fetching uruntime $URUNTIME_VERSION ($URUNTIME_VARIANT, $APPIMAGE_ARCH)"
+URUNTIME_BIN="$TOOLS_DIR/uruntime-$URUNTIME_VERSION-$URUNTIME_VARIANT-$APPIMAGE_ARCH"
+download \
+    "https://github.com/VHSgunzo/uruntime/releases/download/$URUNTIME_VERSION/uruntime-$URUNTIME_VARIANT-$APPIMAGE_ARCH" \
+    "$URUNTIME_BIN"
+
+if [ -n "$URUNTIME_SHA256" ]; then
+    EXPECTED_URUNTIME_SHA256="$URUNTIME_SHA256"
+elif [ "$URUNTIME_VERSION" = "$URUNTIME_PINNED_VERSION" ]; then
+    EXPECTED_URUNTIME_SHA256="$URUNTIME_SHA256_PINNED"
+else
+    echo "set URUNTIME_SHA256 to verify uruntime $URUNTIME_VERSION" >&2
+    exit 1
+fi
+
+verify_sha256 "$URUNTIME_BIN" "$EXPECTED_URUNTIME_SHA256"
 
 echo "==> Assembling AppDir"
 rm -rf "$APPDIR"
@@ -99,11 +143,12 @@ cp "$ROOT/assets/ouch-decompress-gui-256.png" "$APPDIR/.DirIcon"
 install -m 0755 "$ROOT/packaging/AppRun" "$APPDIR/AppRun"
 
 if [ "${SKIP_LINUXDEPLOY:-0}" != "1" ]; then
-    echo "==> Bundling shared libraries with linuxdeploy"
-    LINUXDEPLOY="$TOOLS_DIR/linuxdeploy-$APPIMAGE_ARCH.AppImage"
+    echo "==> Bundling shared libraries with linuxdeploy $LINUXDEPLOY_VERSION"
+    LINUXDEPLOY="$TOOLS_DIR/linuxdeploy-$LINUXDEPLOY_VERSION-$APPIMAGE_ARCH.AppImage"
     download \
-        "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$APPIMAGE_ARCH.AppImage" \
+        "https://github.com/linuxdeploy/linuxdeploy/releases/download/$LINUXDEPLOY_VERSION/linuxdeploy-$APPIMAGE_ARCH.AppImage" \
         "$LINUXDEPLOY"
+    verify_sha256 "$LINUXDEPLOY" "$LINUXDEPLOY_SHA256_PINNED"
     if APPIMAGE_EXTRACT_AND_RUN=1 "$LINUXDEPLOY" \
         --appdir "$APPDIR" \
         --desktop-file "$APPDIR/ouch-decompress-gui.desktop" \
@@ -120,12 +165,16 @@ fi
 echo "==> Bundling ouch (post-linuxdeploy)"
 install -m 0755 "$OUCH_BIN" "$APPDIR/usr/bin/ouch"
 
-echo "==> Creating AppImage"
-APPIMAGETOOL="$TOOLS_DIR/appimagetool-$APPIMAGE_ARCH.AppImage"
+echo "==> Creating AppImage with appimagetool $APPIMAGETOOL_VERSION"
+APPIMAGETOOL="$TOOLS_DIR/appimagetool-$APPIMAGETOOL_VERSION-$APPIMAGE_ARCH.AppImage"
 download \
-    "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$APPIMAGE_ARCH.AppImage" \
+    "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$APPIMAGE_ARCH.AppImage" \
     "$APPIMAGETOOL"
+verify_sha256 "$APPIMAGETOOL" "$APPIMAGETOOL_SHA256_PINNED"
 
+# uruntime replaces the type2 runtime. The squashfs-lite variant carries only
+# the SquashFS mount/extract helpers; appimagetool still builds the SquashFS
+# payload and writes update information into uruntime's `.upd_info` section.
 # Embed update information so AppImage managers (e.g. Gear Lever, which reads
 # the ELF `.upd_info` section) can update the installed file from GitHub
 # Releases. appimagetool bundles its own zsyncmake and also generates the
@@ -137,7 +186,8 @@ UPDATE_INFO="gh-releases-zsync|${GH_OWNER}|${GH_NAME}|latest|Ouch-Decompress-Gui
 
 OUTPUT="$DIST_DIR/Ouch-Decompress-Gui-$APPIMAGE_ARCH.AppImage"
 ARCH="$APPIMAGE_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 \
-    "$APPIMAGETOOL" --updateinformation "$UPDATE_INFO" "$APPDIR" "$OUTPUT"
+    "$APPIMAGETOOL" --runtime-file "$URUNTIME_BIN" \
+    --updateinformation "$UPDATE_INFO" "$APPDIR" "$OUTPUT"
 
 # zsyncmake may drop the `.zsync` in the current directory instead of next to
 # the AppImage; move it so the release upload picks it up. Always replace a

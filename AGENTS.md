@@ -54,6 +54,13 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
   upstream, because it makes the interface unresponsive.
 - The bundled `ouch` is a static-PIE binary, so it must be copied into the
   AppDir *after* `linuxdeploy` runs (see `packaging/build-appimage.sh`).
+- AppImage build inputs are pinned in `packaging/versions.env` (`ouch`,
+  uruntime, `appimagetool` and `linuxdeploy`) and verified by SHA-256. The
+  build script and the release workflow both source that file; keep it as the
+  single source of truth. The
+  [uruntime](https://github.com/VHSgunzo/uruntime) runtime is passed to
+  `appimagetool` with `--runtime-file`, and `--appimage-updateinfo` must keep
+  reporting the `gh-releases-zsync` string when bumping it.
 - Extraction progress is *estimated*: `ouch` exposes no progress, so each worker
   polls its child's `/proc/<pid>/io` `rchar` and divides it by the archive size
   (`src/job.rs`). Keep it best-effort and Linux-only.
@@ -64,12 +71,15 @@ Always run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
 
 ## Rust quality bar
 
-The Rust here follows the `rust-best-practices` skill from BeautifulRust
-(https://github.com/morganlinton/BeautifulRust). Load it before writing,
-refactoring or explaining Rust, `rust-review` before reviewing a file, module
-or diff (it produces a prioritized `Must fix` / `Should fix` / `Consider`
-report with `file:line` and the rule each finding breaks), and `rust-port` only
-when translating code from another language.
+The `rust-best-practices`, `rust-review` and `rust-port` skills from
+BeautifulRust (https://github.com/morganlinton/BeautifulRust, MIT) are vendored
+in `.agents/skills/` at upstream commit `b971843` (v1.6.0). **Any Rust
+writing — new code, refactors, fixes, tests or docs — must load and follow
+`rust-best-practices` first.** Load `rust-review` before reviewing a file,
+module or diff (it produces a prioritized `Must fix` / `Should fix` /
+`Consider` report with `file:line` and the rule each finding breaks), and
+`rust-port` only when translating code from another language. To update, copy
+the upstream `SKILL.md` and `references/` folders and bump the pinned commit.
 
 - This is **application code**: concrete types, `anyhow` with `.context(...)`,
   no speculative generics or trait abstractions.
@@ -103,6 +113,15 @@ reason.
 - **Every change starts on its own branch.** Never commit directly to `develop`
   or `main`: branch off `develop` using a descriptive prefix (`feature/...`,
   `fix/...`, `docs/...`, `chore/...`) and merge it back into `develop`.
+- **Never merge a change branch into `develop` without explicit user
+  confirmation.** Prepare the branch, run the checks below, and ask first;
+  merging is a separate step the user must approve.
+- **Before merging any change branch into `develop`, run the `rust-review` skill
+  over `git diff develop...HEAD` and fix every `Must fix` finding.** If the
+  diff contains no Rust code, state that in the merge request instead of
+  skipping the review silently. Re-run `cargo fmt`,
+  `cargo clippy --all-targets -- -D warnings` and
+  `cargo test --release --locked` before the merge.
 - Merge `develop` into `main` only when preparing a release, then push a tag
   `vX.Y.Z`. `.github/workflows/release.yml` builds the AppImages and creates the
   GitHub release.
