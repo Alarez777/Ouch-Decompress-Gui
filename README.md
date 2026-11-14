@@ -190,7 +190,7 @@ packaging/build-appimage.sh aarch64
 ```
 
 The build inputs are pinned in `packaging/versions.env`: `ouch` 0.8.3,
-[uruntime](https://github.com/VHSgunzo/uruntime) `v0.8.1`
+[uruntime](https://github.com/VHSgunzo/uruntime) `v0.8.2`
 (`appimage-squashfs-lite`), `appimagetool` 1.9.1 and `linuxdeploy`
 `1-alpha-20251107-1`. The script downloads them into `.cache/` and verifies
 the runtime and both build tools by SHA-256, so subsequent runs are offline

@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   information and `.zsync` generation are unchanged.
 - `appimagetool` and `linuxdeploy` are pinned in `packaging/versions.env` and
   verified by SHA-256, so release builds are reproducible.
+- Updated uruntime to `v0.8.2`, which fixes automatic mount recovery after
+  interrupted PID-record publication, fixes helper execution without procfs,
+  and updates the bundled squashfuse to 0.6.5.
 
 ## [0.4.2] - 2026-11-09
 
