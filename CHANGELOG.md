@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-22
+
+### Fixed
+
+- `Ctrl+V`, `Ctrl+C` and `Ctrl+X` now use the system clipboard in the
+  password fields and other text inputs, including the **Copy log** buttons.
+
 ## [0.4.3] - 2026-11-14
 
 ### Changed
