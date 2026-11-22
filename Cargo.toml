@@ -15,11 +15,14 @@ name = "ouch-decompress-gui"
 path = "src/main.rs"
 
 [dependencies]
+# eframe's default features are disabled, so the system clipboard must be
+# requested explicitly; otherwise Ctrl+V/Ctrl+C only use egui's in-app fallback.
 eframe = { version = "0.37", default-features = false, features = [
     "glow",
     "x11",
     "wayland",
     "default_fonts",
+    "clipboard",
 ] }
 egui = "0.37"
 serde = { version = "1", features = ["derive"] }
