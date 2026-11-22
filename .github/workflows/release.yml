@@ -43,6 +43,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.arch }}-cargo-
 
+      # The clipboard fix depends on this eframe feature; fail early if it is
+      # accidentally dropped.
+      - name: Check eframe clipboard feature
+        run: cargo tree --locked -e features -p egui-winit | grep -q clipboard
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
