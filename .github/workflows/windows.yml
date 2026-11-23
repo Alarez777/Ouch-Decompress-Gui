@@ -75,6 +75,17 @@ jobs:
             throw "ouch-decompress-gui.exe --version did not print the version"
           }
 
+      - name: GUI smoke test
+        shell: pwsh
+        run: |
+          $exe = "dist/windows/ouch-decompress-gui.exe"
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 3
+          if ($proc.HasExited) {
+            throw "GUI exited early with code $($proc.ExitCode)"
+          }
+          Stop-Process -Id $proc.Id -Force
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
