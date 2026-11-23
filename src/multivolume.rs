@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use crate::split::SplitKind;
 
 /// Keep this much RAM free before putting the temporary in `/dev/shm`.
+#[cfg(target_os = "linux")]
 const RAM_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
 
 /// A source ready to be handed to `ouch`, plus the temporary it may own.
@@ -106,14 +107,20 @@ fn base_name(archive: &Path) -> String {
 fn choose_temp_dir(archive: &Path, total: u64) -> PathBuf {
     let name = format!("ouch-{}-{}", std::process::id(), unique_nanos());
 
-    let shm = Path::new("/dev/shm");
-    if shm.is_dir() && is_writable(shm) {
-        let fits_disk = available_space(shm).is_some_and(|free| free >= total);
-        let fits_ram = mem_available().is_some_and(|free| free >= total.saturating_add(RAM_MARGIN));
-        if fits_disk && fits_ram {
-            return shm.join(name);
+    #[cfg(target_os = "linux")]
+    {
+        let shm = Path::new("/dev/shm");
+        if shm.is_dir() && is_writable(shm) {
+            let fits_disk = available_space(shm).is_some_and(|free| free >= total);
+            let fits_ram =
+                mem_available().is_some_and(|free| free >= total.saturating_add(RAM_MARGIN));
+            if fits_disk && fits_ram {
+                return shm.join(name);
+            }
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = total;
 
     let parent = archive
         .parent()
@@ -178,6 +185,7 @@ fn unique_nanos() -> u128 {
 }
 
 /// True when `path` exists and is writable by this user.
+#[cfg(target_os = "linux")]
 fn is_writable(path: &Path) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -190,6 +198,7 @@ fn is_writable(path: &Path) -> bool {
 }
 
 /// Free bytes on the filesystem containing `path`.
+#[cfg(target_os = "linux")]
 fn available_space(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -211,6 +220,7 @@ fn available_space(path: &Path) -> Option<u64> {
 }
 
 /// `MemAvailable` from `/proc/meminfo`, in bytes.
+#[cfg(target_os = "linux")]
 fn mem_available() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in contents.lines() {

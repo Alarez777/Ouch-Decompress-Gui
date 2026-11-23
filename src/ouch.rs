@@ -47,16 +47,18 @@ impl OuchClient {
         }
         bail!(
             "could not find a working `ouch` binary. It is normally bundled with \
-             the AppImage; otherwise install it with your package manager or \
-             `cargo install ouch`."
+             the AppImage or installer; otherwise install it with your package \
+             manager or `cargo install ouch`."
         )
     }
 
     /// Ordered list of locations to search for `ouch`.
     fn candidates() -> Vec<PathBuf> {
+        let ouch_name = if cfg!(windows) { "ouch.exe" } else { "ouch" };
         let mut candidates = Vec::new();
 
         // 1. Bundled inside the AppImage: $APPDIR/usr/bin/ouch
+        #[cfg(target_os = "linux")]
         if let Ok(appdir) = std::env::var("APPDIR") {
             candidates.push(PathBuf::from(appdir).join("usr/bin/ouch"));
         }
@@ -64,10 +66,10 @@ impl OuchClient {
         // 2. Next to the running executable / in the same tree.
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("ouch"));
+                candidates.push(dir.join(ouch_name));
                 // Typical `target/release` -> repo root layout during dev.
                 if let Some(parent) = dir.parent() {
-                    candidates.push(parent.join("ouch"));
+                    candidates.push(parent.join(ouch_name));
                 }
             }
         }
@@ -75,7 +77,7 @@ impl OuchClient {
         // 3. Directories on PATH.
         if let Some(path_var) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path_var) {
-                candidates.push(dir.join("ouch"));
+                candidates.push(dir.join(ouch_name));
             }
         }
 

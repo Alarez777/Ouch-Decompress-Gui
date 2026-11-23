@@ -2030,53 +2030,55 @@ impl App {
         }
 
         ui.add_space(12.0);
-        ui.separator();
-        ui.label(egui::RichText::new(self.i18n.t("settings.associations")).strong());
-        ui.label(
-            egui::RichText::new(self.i18n.t("settings.associations_hint"))
-                .small()
-                .color(egui::Color32::GRAY),
-        );
-        if ui.button(self.i18n.t("settings.set_default")).clicked() {
-            match crate::association::set_default(&self.config) {
-                Ok(()) => {
-                    self.association_status = self.i18n.t("settings.set_default.done");
-                }
-                Err(err) => {
-                    self.association_status = format!("{}: {err}", self.i18n.t("common.error"));
-                }
-            }
-        }
-
-        if crate::association::running_as_appimage() {
-            ui.add_space(12.0);
+        if cfg!(target_os = "linux") {
             ui.separator();
-            ui.label(egui::RichText::new(self.i18n.t("settings.desktop.title")).strong());
-            ui.colored_label(
-                egui::Color32::from_rgb(0xc8, 0x8a, 0x00),
-                self.i18n.t("settings.desktop.hint"),
-            );
-            ui.horizontal(|ui| {
-                if ui.button(self.i18n.t("settings.desktop.create")).clicked() {
-                    self.association_status = match crate::association::create_desktop(&self.config)
-                    {
-                        Ok(_) => self.i18n.t("settings.desktop.created"),
-                        Err(err) => format!("{}: {err}", self.i18n.t("common.error")),
-                    };
-                }
-                if ui.button(self.i18n.t("settings.desktop.remove")).clicked() {
-                    crate::association::remove_desktop();
-                    self.association_status = self.i18n.t("settings.desktop.removed");
-                }
-            });
-        }
-
-        if !self.association_status.is_empty() {
+            ui.label(egui::RichText::new(self.i18n.t("settings.associations")).strong());
             ui.label(
-                egui::RichText::new(&self.association_status)
+                egui::RichText::new(self.i18n.t("settings.associations_hint"))
                     .small()
                     .color(egui::Color32::GRAY),
             );
+            if ui.button(self.i18n.t("settings.set_default")).clicked() {
+                match crate::association::set_default(&self.config) {
+                    Ok(()) => {
+                        self.association_status = self.i18n.t("settings.set_default.done");
+                    }
+                    Err(err) => {
+                        self.association_status = format!("{}: {err}", self.i18n.t("common.error"));
+                    }
+                }
+            }
+
+            if crate::association::running_as_appimage() {
+                ui.add_space(12.0);
+                ui.separator();
+                ui.label(egui::RichText::new(self.i18n.t("settings.desktop.title")).strong());
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xc8, 0x8a, 0x00),
+                    self.i18n.t("settings.desktop.hint"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button(self.i18n.t("settings.desktop.create")).clicked() {
+                        self.association_status =
+                            match crate::association::create_desktop(&self.config) {
+                                Ok(_) => self.i18n.t("settings.desktop.created"),
+                                Err(err) => format!("{}: {err}", self.i18n.t("common.error")),
+                            };
+                    }
+                    if ui.button(self.i18n.t("settings.desktop.remove")).clicked() {
+                        crate::association::remove_desktop();
+                        self.association_status = self.i18n.t("settings.desktop.removed");
+                    }
+                });
+            }
+
+            if !self.association_status.is_empty() {
+                ui.label(
+                    egui::RichText::new(&self.association_status)
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            }
         }
     }
 

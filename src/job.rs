@@ -1211,11 +1211,48 @@ fn parse_wchar(contents: &str) -> Option<u64> {
 }
 
 /// Bytes read and written by the given process so far, from `/proc/<pid>/io`.
+#[cfg(target_os = "linux")]
 fn process_io(pid: u32) -> Option<(u64, u64)> {
     let contents = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
     let read = parse_rchar(&contents)?;
     let write = parse_wchar(&contents).unwrap_or(0);
     Some((read, write))
+}
+
+/// Bytes read and written by the given process, from `GetProcessIoCounters`.
+#[cfg(windows)]
+fn process_io(pid: u32) -> Option<(u64, u64)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessIoCounters, OpenProcess, IO_COUNTERS, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return None;
+    }
+
+    // SAFETY: `OpenProcess` only reads the PID and access mask. The returned
+    // handle is checked before use and closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+    if handle.is_null() {
+        return None;
+    }
+
+    // SAFETY: `IO_COUNTERS` is a plain C struct, so an all-zero bit pattern is
+    // valid, and `GetProcessIoCounters` fills it before it is read.
+    let mut counters = unsafe { std::mem::zeroed::<IO_COUNTERS>() };
+    // SAFETY: `handle` is a live process handle and `counters` is writable.
+    let ok = unsafe { GetProcessIoCounters(handle, &raw mut counters) };
+    // SAFETY: `handle` came from `OpenProcess` and is closed exactly once.
+    unsafe {
+        CloseHandle(handle);
+    }
+
+    if ok == 0 {
+        None
+    } else {
+        Some((counters.ReadTransferCount, counters.WriteTransferCount))
+    }
 }
 
 /// Time constant (in seconds) of the write-speed average. Bigger values make

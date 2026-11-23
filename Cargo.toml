@@ -30,14 +30,26 @@ serde_json = "1"
 anyhow = "1"
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # GNOME/Adwaita-style client-side decorations on Wayland, so the window
 # titlebar matches native GNOME apps.
+[target.'cfg(target_os = "linux")'.dependencies]
 winit = { version = "0.30.13", default-features = false, features = [
     "wayland-csd-adwaita",
     "wayland-dlopen",
 ] }
+
+[target.'cfg(windows)'.dependencies]
+rfd = "0.18"
+trash = "5.4"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+winreg = "0.56"
 
 # Lints from the BeautifulRust guide (https://github.com/morganlinton/BeautifulRust),
 # adapted to a binary crate. Warning groups (`all`, `pedantic`) are added later;

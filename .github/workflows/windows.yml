@@ -1,0 +1,80 @@
+name: Windows build
+
+# Temporary workflow for the Windows port: builds the GUI and a portable
+# package while the installer pipeline is not ready yet.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/windows-support
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-windows-x86_64-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-windows-x86_64-cargo-
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Compile tests
+        run: cargo test --release --locked --no-run
+
+      - name: Prepare portable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = "dist/windows"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target/release/ouch-decompress-gui.exe" "$dist/"
+
+          $zip = "ouch-windows.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/ouch-org/ouch/releases/download/0.8.3/ouch-x86_64-pc-windows-msvc.zip" `
+            -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "ouch-windows" -Force
+          $ouch = Get-ChildItem -Path "ouch-windows" -Filter "ouch.exe" -Recurse |
+            Select-Object -First 1
+          if (-not $ouch) {
+            throw "ouch.exe not found in the ouch Windows archive"
+          }
+          Copy-Item $ouch.FullName "$dist/ouch.exe"
+          Copy-Item "README.md" "$dist/README.md"
+          Copy-Item "LICENSE" "$dist/LICENSE"
+
+          Compress-Archive -Path "$dist/*" `
+            -DestinationPath "dist/Ouch-Decompress-Gui-windows-x86_64.zip" -Force
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = "dist/windows/ouch-decompress-gui.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "ouch-decompress-gui.exe --version failed with $LASTEXITCODE"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ouch-Decompress-Gui-windows-x86_64
+          path: dist/Ouch-Decompress-Gui-windows-x86_64.zip
+          if-no-files-found: error

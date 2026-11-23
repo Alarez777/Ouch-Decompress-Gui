@@ -1,8 +1,8 @@
 //! Best-effort update check against the project's GitHub releases.
 //!
-//! Uses `curl` (already present on most Linux desktops) so the app does not
-//! need a full HTTP client dependency. The check runs on a background thread
-//! and never blocks the UI.
+//! Uses `curl` (present on most Linux desktops and on Windows 10+) so the app
+//! does not need a full HTTP client dependency. The check runs on a background
+//! thread and never blocks the UI.
 
 use std::sync::mpsc::{self, Receiver};
 use std::thread;

@@ -1,10 +1,16 @@
-//! Ouch Decompress GUI: a lightweight GUI to extract archives on Linux.
+//! Ouch Decompress GUI: a lightweight GUI to extract archives.
 //!
 //! The binary doubles as the file-manager handler: when archive paths are
 //! passed on the command line (double-click / "Open with"), it extracts them
 //! immediately. With no arguments it opens the main window.
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
+#[cfg(target_os = "linux")]
+mod association;
+#[cfg(windows)]
+#[path = "association_windows.rs"]
 mod association;
 mod config;
 mod formats;

@@ -128,7 +128,7 @@
   "log.clear": "Clear log",
   "log.empty": "The log is empty.",
   "ouch.not_found": "The ouch binary could not be found.",
-  "ouch.not_found_hint": "Install ouch or use the bundled AppImage.",
+  "ouch.not_found_hint": "Install ouch or use the bundled version.",
   "error.missing_parts": "Incomplete archive — missing: {names}",
   "error.missing_parts_of": "Incomplete archive — missing: {names} (of {total})",
   "error.missing_parts_at_least": "Incomplete archive — missing at least: {names}",

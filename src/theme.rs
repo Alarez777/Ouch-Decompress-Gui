@@ -32,6 +32,23 @@ impl ThemeChoice {
 /// user switches between light and dark. `gsettings` can disagree (GNOME leaves
 /// `color-scheme` at `default` even in dark mode), so it is only a fallback.
 pub fn system_prefers_dark() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_prefers_dark()
+    }
+    #[cfg(windows)]
+    {
+        windows_prefers_dark()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        false
+    }
+}
+
+/// Detects the desktop color scheme on Linux.
+#[cfg(target_os = "linux")]
+fn linux_prefers_dark() -> bool {
     if let Some(dark) = portal_prefers_dark() {
         return dark;
     }
@@ -63,10 +80,27 @@ pub fn system_prefers_dark() -> bool {
     false
 }
 
+/// Reads the Windows "app mode" preference from the registry.
+#[cfg(windows)]
+fn windows_prefers_dark() -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(key) =
+        hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+    else {
+        return false;
+    };
+    let light: u32 = key.get_value("AppsUseLightTheme").unwrap_or(1);
+    light == 0
+}
+
 /// Asks the XDG desktop portal for the preferred color scheme.
 ///
 /// `color-scheme` is `0` (no preference), `1` (prefer dark) or `2` (prefer
 /// light). Returns `None` when the portal is unavailable or has no preference.
+#[cfg(target_os = "linux")]
 fn portal_prefers_dark() -> Option<bool> {
     let output = std::process::Command::new("gdbus")
         .args([
@@ -99,6 +133,7 @@ fn portal_prefers_dark() -> Option<bool> {
 
 /// Runs `gsettings get <schema> <key>` and returns the trimmed plain value,
 /// stripping the surrounding single quotes gsettings uses for strings.
+#[cfg(target_os = "linux")]
 fn gsettings_get(schema: &str, key: &str) -> Option<String> {
     let output = std::process::Command::new("gsettings")
         .args(["get", schema, key])
