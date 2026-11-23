@@ -47,6 +47,7 @@ rfd = "0.18"
 trash = "5.4"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_System_Console",
     "Win32_System_Threading",
 ] }
 winreg = "0.56"

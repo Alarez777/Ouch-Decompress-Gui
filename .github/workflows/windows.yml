@@ -68,6 +68,9 @@ jobs:
         run: |
           $exe = "dist/windows/ouch-decompress-gui.exe"
           $output = & $exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "ouch-decompress-gui.exe --version failed with $LASTEXITCODE"
+          }
           if (-not ($output -match "ouch-decompress-gui")) {
             throw "ouch-decompress-gui.exe --version did not print the version"
           }

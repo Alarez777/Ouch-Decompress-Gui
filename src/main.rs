@@ -4,8 +4,6 @@
 //! passed on the command line (double-click / "Open with"), it extracts them
 //! immediately. With no arguments it opens the main window.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod app;
 #[cfg(target_os = "linux")]
 mod association;
@@ -50,6 +48,11 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Windows builds use the console subsystem so `--help`/`--version` work;
+    // detach it before opening the GUI to avoid leaving a console window.
+    #[cfg(windows)]
+    detach_console();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_app_id("ouch-decompress-gui")
         .with_inner_size(DEFAULT_WINDOW_SIZE)
@@ -78,6 +81,18 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new(cc, options.files, startup)))
         }),
     )
+}
+
+/// Detaches the process from the console allocated by the console subsystem.
+#[cfg(windows)]
+fn detach_console() {
+    use windows_sys::Win32::System::Console::FreeConsole;
+
+    // SAFETY: `FreeConsole` has no preconditions; it only detaches this process
+    // from its console. Having no console is not an error for us.
+    unsafe {
+        FreeConsole();
+    }
 }
 
 /// Parsed command-line options.
