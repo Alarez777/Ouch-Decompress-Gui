@@ -79,9 +79,14 @@ jobs:
         shell: pwsh
         run: |
           $exe = "dist/windows/ouch-decompress-gui.exe"
-          $proc = Start-Process -FilePath $exe -PassThru
+          $stdout = "gui-stdout.txt"
+          $stderr = "gui-stderr.txt"
+          $proc = Start-Process -FilePath $exe -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
           Start-Sleep -Seconds 3
           if ($proc.HasExited) {
+            Get-Content $stdout
+            Get-Content $stderr
             throw "GUI exited early with code $($proc.ExitCode)"
           }
           Stop-Process -Id $proc.Id -Force
