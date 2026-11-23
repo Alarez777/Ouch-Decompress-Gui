@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Updated uruntime to `v0.8.5`, which preserves the original invocation name
+  when FUSE is unavailable or a mount retry happens.
+
 ## [0.4.4] - 2026-11-22
 
 ### Fixed
