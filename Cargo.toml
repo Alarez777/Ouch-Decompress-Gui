@@ -15,15 +15,6 @@ name = "ouch-decompress-gui"
 path = "src/main.rs"
 
 [dependencies]
-# eframe's default features are disabled, so the system clipboard must be
-# requested explicitly; otherwise Ctrl+V/Ctrl+C only use egui's in-app fallback.
-eframe = { version = "0.37", default-features = false, features = [
-    "glow",
-    "x11",
-    "wayland",
-    "default_fonts",
-    "clipboard",
-] }
 egui = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,15 +25,30 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# eframe's default features are disabled, so the system clipboard must be
+# requested explicitly; otherwise Ctrl+V/Ctrl+C only use egui's in-app fallback.
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "x11",
+    "wayland",
+    "default_fonts",
+    "clipboard",
+] }
 # GNOME/Adwaita-style client-side decorations on Wayland, so the window
 # titlebar matches native GNOME apps.
-[target.'cfg(target_os = "linux")'.dependencies]
 winit = { version = "0.30.13", default-features = false, features = [
     "wayland-csd-adwaita",
     "wayland-dlopen",
 ] }
 
 [target.'cfg(windows)'.dependencies]
+# wgpu uses DX12/Vulkan/WARP on Windows and does not require OpenGL 2.0+.
+eframe = { version = "0.37", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "clipboard",
+] }
 rfd = "0.18"
 trash = "5.4"
 windows-sys = { version = "0.61", features = [

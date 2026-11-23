@@ -1175,7 +1175,14 @@ impl eframe::App for App {
         self.draw_drop_overlay(&ctx);
     }
 
+    #[cfg(target_os = "linux")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Do not let the file picker outlive the window.
+        crate::system::terminate_process(self.picker_pid.load(Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    fn on_exit(&mut self) {
         // Do not let the file picker outlive the window.
         crate::system::terminate_process(self.picker_pid.load(Ordering::Relaxed));
     }
