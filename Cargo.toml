@@ -58,6 +58,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 winreg = "0.56"
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 # Lints from the BeautifulRust guide (https://github.com/morganlinton/BeautifulRust),
 # adapted to a binary crate. Warning groups (`all`, `pedantic`) are added later;
 # `unreachable_pub` is omitted because every `pub` item in a binary is

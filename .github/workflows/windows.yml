@@ -1,7 +1,8 @@
 name: Windows build
 
-# Temporary workflow for the Windows port: builds the GUI and a portable
-# package while the installer pipeline is not ready yet.
+# Temporary workflow for the Windows port: builds the GUI, the installer and
+# runs smoke tests. The release workflow will absorb this once the port is
+# merged.
 on:
   workflow_dispatch:
   push:
@@ -13,7 +14,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Windows x86_64
+    name: Build Windows x86_64 installer
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,13 +33,35 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-windows-x86_64-cargo-
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = Get-ChildItem `
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe", `
+            "C:\Program Files\Inno Setup 6\ISCC.exe" `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) {
+            throw "ISCC.exe not found after installing Inno Setup"
+          }
+          "ISCC=$($iscc.FullName)" >> $env:GITHUB_ENV
+
+      - name: Read version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches.Groups[1].Value
+          if (-not $version) {
+            throw "could not read the package version from Cargo.toml"
+          }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+
       - name: Build
         run: cargo build --release --locked
 
       - name: Compile tests
         run: cargo test --release --locked --no-run
 
-      - name: Prepare portable package
+      - name: Prepare installer files
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -60,8 +83,31 @@ jobs:
           Copy-Item "README.md" "$dist/README.md"
           Copy-Item "LICENSE" "$dist/LICENSE"
 
-          Compress-Archive -Path "$dist/*" `
-            -DestinationPath "dist/Ouch-Decompress-Gui-windows-x86_64.zip" -Force
+      - name: Sign executable
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) {
+            Write-Host "::warning::WINDOWS_CERTIFICATE is not configured; the executable will be unsigned."
+            exit 0
+          }
+          $signtool = Get-ChildItem `
+            "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction SilentlyContinue | Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signtool) {
+            throw "signtool.exe not found"
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+            /tr http://timestamp.digicert.com /td sha256 /fd sha256 `
+            "dist/windows/ouch-decompress-gui.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "signing the executable failed"
+          }
 
       - name: Smoke test
         shell: pwsh
@@ -91,9 +137,88 @@ jobs:
           }
           Stop-Process -Id $proc.Id -Force
 
-      - name: Upload artifact
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & $env:ISCC "/DAppVersion=$env:APP_VERSION" `
+            "/O$PWD\dist" "packaging\windows\ouch-decompress-gui.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+          $installer = "dist\Ouch-Decompress-Gui-Setup-$env:APP_VERSION.exe"
+          if (-not (Test-Path $installer)) {
+            throw "installer not found: $installer"
+          }
+
+      - name: Sign installer
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) {
+            Write-Host "::warning::WINDOWS_CERTIFICATE is not configured; the installer will be unsigned."
+            exit 0
+          }
+          $signtool = Get-ChildItem `
+            "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction SilentlyContinue | Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signtool) {
+            throw "signtool.exe not found"
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+            /tr http://timestamp.digicert.com /td sha256 /fd sha256 `
+            "dist/Ouch-Decompress-Gui-Setup-$env:APP_VERSION.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "signing the installer failed"
+          }
+
+      - name: Installer smoke test
+        shell: pwsh
+        run: |
+          $installer = "dist\Ouch-Decompress-Gui-Setup-$env:APP_VERSION.exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "OuchDecompressTest"
+          if (Test-Path $installDir) {
+            Remove-Item -Recurse -Force $installDir
+          }
+
+          $install = Start-Process -FilePath $installer `
+            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-","/TASKS=associate","/DIR=$installDir" `
+            -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "installer failed with exit code $($install.ExitCode)"
+          }
+
+          $exe = Join-Path $installDir "ouch-decompress-gui.exe"
+          if (-not (Test-Path $exe)) {
+            throw "installed executable not found"
+          }
+          $output = & $exe --version
+          if (-not ($output -match "ouch-decompress-gui")) {
+            throw "installed executable failed the version check"
+          }
+
+          $assoc = Get-ItemProperty `
+            -Path "HKCU:\Software\Classes\.zip\OpenWithProgids" `
+            -Name "OuchDecompress.Archive" -ErrorAction SilentlyContinue
+          if (-not $assoc) {
+            throw "the .zip file association was not registered"
+          }
+
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          $uninstall = Start-Process -FilePath $uninstaller `
+            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" `
+            -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            throw "uninstaller failed with exit code $($uninstall.ExitCode)"
+          }
+
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: Ouch-Decompress-Gui-windows-x86_64
-          path: dist/Ouch-Decompress-Gui-windows-x86_64.zip
+          name: Ouch-Decompress-Gui-windows-x86_64-installer
+          path: dist/Ouch-Decompress-Gui-Setup-*.exe
           if-no-files-found: error

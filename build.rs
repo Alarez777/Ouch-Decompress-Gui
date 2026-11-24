@@ -1,6 +1,8 @@
 //! Injects the resolved versions of the GUI crates into the binary, for the
-//! About window. Cargo does not expose dependency versions to `env!`, so the
-//! versions are read from `Cargo.lock` at build time.
+//! About window, and embeds the Windows icon/version resource.
+//!
+//! Cargo does not expose dependency versions to `env!`, so the versions are
+//! read from `Cargo.lock` at build time.
 
 use std::fs;
 
@@ -11,6 +13,22 @@ fn main() {
     for name in ["egui", "eframe"] {
         let version = find_version(&lock, name).unwrap_or_else(|| "?".to_string());
         println!("cargo:rustc-env={}_VERSION={version}", name.to_uppercase());
+    }
+
+    #[cfg(windows)]
+    {
+        println!("cargo:rerun-if-changed=assets/ouch-decompress-gui.ico");
+        let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+        let file_version = format!("{version}.0");
+        let mut res = winres::WindowsResource::new();
+        res.set_icon("assets/ouch-decompress-gui.ico");
+        res.set("ProductName", "Ouch Decompress");
+        res.set("FileDescription", "Archive extractor powered by ouch");
+        res.set("ProductVersion", &file_version);
+        res.set("FileVersion", &file_version);
+        res.set("LegalCopyright", "MIT");
+        res.set("OriginalFilename", "ouch-decompress-gui.exe");
+        res.compile().expect("compiling Windows resources");
     }
 }
 
