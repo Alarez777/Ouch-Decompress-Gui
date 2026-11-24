@@ -185,10 +185,12 @@ jobs:
             Remove-Item -Recurse -Force $installDir
           }
 
+          $log = Join-Path $env:RUNNER_TEMP "install.log"
           $install = Start-Process -FilePath $installer `
-            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-","/TASKS=associate","/DIR=$installDir" `
+            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-","/MERGETASKS=associate","/DIR=$installDir","/LOG=$log" `
             -Wait -PassThru
           if ($install.ExitCode -ne 0) {
+            if (Test-Path $log) { Get-Content $log -Tail 120 }
             throw "installer failed with exit code $($install.ExitCode)"
           }
 
@@ -200,6 +202,20 @@ jobs:
           if (-not ($output -match "ouch-decompress-gui")) {
             throw "installed executable failed the version check"
           }
+
+          Write-Host "Registry debug:"
+          Get-ChildItem "HKCU:\Software\Classes" -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -like '*Ext*' -or $_.PSChildName -eq '.zip' } |
+            Select-Object -ExpandProperty PSChildName
+          Get-ItemProperty "HKCU:\Software\Classes\.zip" -ErrorAction SilentlyContinue |
+            Format-List
+          Get-ChildItem "HKCU:\Software\Classes\.zip" -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty PSChildName
+          Get-ItemProperty "HKCU:\Software\Classes\.zip\OpenWithProgids" `
+            -ErrorAction SilentlyContinue | Format-List
+          Get-ChildItem "HKCU:\Software\OuchDecompress" -Recurse `
+            -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          if (Test-Path $log) { Get-Content $log -Tail 120 }
 
           $assoc = Get-ItemProperty `
             -Path "HKCU:\Software\Classes\.zip\OpenWithProgids" `
