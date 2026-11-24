@@ -90,92 +90,92 @@ Root: HKCU; Subkey: "Software\OuchDecompress\Capabilities"; ValueType: string; V
 
 ; Extensions
 #define Ext "tar"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tgz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tbz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tbz2"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tbz3"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tlz4"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "txz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tlzma"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tsz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tzst"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "tlz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "cbt"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "zip"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "cbz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "epub"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "7z"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "cb7"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "rar"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "cbr"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "gz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "bz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "bz2"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "bz3"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "xz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "lzma"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "lz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "lz4"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "sz"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "zst"
-AssocExt
+#emit AssocExt
 #undef Ext
 #define Ext "br"
-AssocExt
+#emit AssocExt
 #undef Ext
